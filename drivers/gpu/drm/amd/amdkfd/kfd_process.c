@@ -1521,6 +1521,12 @@ void kfd_process_set_trap_handler(struct qcm_process_device *qpd,
 				  uint64_t tba_addr,
 				  uint64_t tma_addr)
 {
+	struct device_queue_manager *dqm = qpd->dqm;
+	uint32_t xcc_mask;
+	int xcc_id;
+
+	pr_warn("kfd_process_set_trap_handler: cwsr_kaddr=%p tba=0x%llx tma=0x%llx\n",
+		qpd->cwsr_kaddr, tba_addr, tma_addr);
 	if (qpd->cwsr_kaddr) {
 		/* KFD trap handler is bound, record as second-level TBA/TMA
 		 * in first-level TMA. First-level trap will jump to second.
@@ -1529,10 +1535,46 @@ void kfd_process_set_trap_handler(struct qcm_process_device *qpd,
 			(uint64_t *)(qpd->cwsr_kaddr + KFD_CWSR_TMA_OFFSET);
 		tma[0] = tba_addr;
 		tma[1] = tma_addr;
+		pr_warn("kfd_process_set_trap_handler: cwsr_tma[0]=0x%llx cwsr_tma[1]=0x%llx cwsr_tma[2]=0x%llx\n",
+			tma[0], tma[1], tma[2]);
+		pr_warn("kfd_process_set_trap_handler: wrote second-level TBA/TMA to cwsr_kaddr+0x%lx\n",
+			KFD_CWSR_TMA_OFFSET);
 	} else {
 		/* No trap handler bound, bind as first-level TBA/TMA. */
 		qpd->tba_addr = tba_addr;
 		qpd->tma_addr = tma_addr;
+		pr_warn("kfd_process_set_trap_handler: stored as first-level (no CWSR)\n");
+	}
+
+	if (qpd->tba_addr && qpd->tma_addr &&
+	    dqm && dqm->dev && dqm->dev->kfd2kgd->program_trap_handler_settings) {
+
+		xcc_mask = dqm->dev->xcc_mask;
+		/*
+		 * Program trap handler only for this process's vmid.
+		 * Programming other vmids is dangerous: the TMA is only
+		 * mapped in this process's page tables, so traps on other
+		 * vmids would fault accessing unmapped TMA.
+		 * MES handles TBA/TMA for context switches via add_queue_mes.
+		 */
+		if (qpd->vmid >= dqm->dev->vm_info.first_vmid_kfd) {
+			for_each_inst(xcc_id, xcc_mask)
+				dqm->dev->kfd2kgd->program_trap_handler_settings(
+					dqm->dev->adev, qpd->vmid,
+					qpd->tba_addr, qpd->tma_addr, xcc_id);
+			pr_warn("kfd_process_set_trap_handler: programmed TBA/TMA for vmid=%u\n",
+				qpd->vmid);
+		} else {
+			pr_warn("kfd_process_set_trap_handler: vmid=%u not yet allocated, skipping SRBM\n",
+				qpd->vmid);
+		}
+
+		/* For CPSCH mode: remap queues to send new MAP_PROCESS packet
+		 * with updated TBA/TMA to the MES. Without this, the MES
+		 * won't know about the trap handler after context switches.
+		 */
+		remap_queue(dqm, KFD_UNMAP_QUEUES_FILTER_ALL_QUEUES, 0);
+		pr_warn("kfd_process_set_trap_handler: remapped queues\n");
 	}
 }
 

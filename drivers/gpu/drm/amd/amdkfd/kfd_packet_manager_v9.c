@@ -73,6 +73,12 @@ static int pm_map_process_v9(struct packet_manager *pm,
 
 		packet->sq_shader_tma_lo = lower_32_bits(qpd->tma_addr >> 8);
 		packet->sq_shader_tma_hi = upper_32_bits(qpd->tma_addr >> 8);
+		pr_warn("pm_map_process_v9: pasid=%u tba=0x%llx tma=0x%llx TRAP_EN=%d\n",
+			pdd->pasid, qpd->tba_addr, qpd->tma_addr,
+			!!(packet->sq_shader_tba_hi & (1 << SQ_SHADER_TBA_HI__TRAP_EN__SHIFT)));
+	} else {
+		pr_warn("pm_map_process_v9: pasid=%u tba_addr=0 (no trap handler)\n",
+			pdd->pasid);
 	}
 
 	packet->gds_addr_lo = lower_32_bits(qpd->gds_context_area);

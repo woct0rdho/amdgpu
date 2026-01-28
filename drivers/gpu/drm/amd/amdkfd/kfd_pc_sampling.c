@@ -61,6 +61,10 @@ struct supported_pc_sample_info supported_formats[] = {
 	{ IP_VERSION(9, 4, 3), &sample_info_stoch_cycle_9_4_3 },
 	{ IP_VERSION(9, 5, 0), &sample_info_hosttrap_9_0_0 },
 	{ IP_VERSION(9, 5, 0), &sample_info_stoch_cycle_9_4_3 },
+	{ IP_VERSION(11, 5, 0), &sample_info_hosttrap_9_0_0 },
+	{ IP_VERSION(11, 5, 1), &sample_info_hosttrap_9_0_0 },
+	{ IP_VERSION(11, 5, 2), &sample_info_hosttrap_9_0_0 },
+	{ IP_VERSION(11, 5, 3), &sample_info_hosttrap_9_0_0 },
 	{ IP_VERSION(12, 0, 0), &sample_info_hosttrap_9_0_0 },
 	{ IP_VERSION(12, 0, 1), &sample_info_hosttrap_9_0_0 },
 };
@@ -73,6 +77,7 @@ static int kfd_pc_sample_thread(void *param)
 	ktime_t next_trap_time;
 	bool need_wait;
 	uint32_t inst;
+	uint32_t target_vmid;
 
 	mutex_lock(&node->pcs_data.mutex);
 	if (node->pcs_data.hosttrap_entry.base.active_count &&
@@ -94,6 +99,7 @@ static int kfd_pc_sample_thread(void *param)
 	adev = node->adev;
 	need_wait = false;
 	allow_signal(SIGKILL);
+	target_vmid = node->pcs_data.hosttrap_entry.target_vmid;
 
 	if (node->kfd2kgd->override_core_cg)
 		for_each_inst(inst, node->xcc_mask)
@@ -105,7 +111,8 @@ static int kfd_pc_sample_thread(void *param)
 			next_trap_time = ktime_add_us(ktime_get_raw(), timeout);
 
 			for_each_inst(inst, node->xcc_mask) {
-			node->kfd2kgd->trigger_pc_sample_trap(adev, node->vm_info.last_vmid_kfd,
+			pr_warn_ratelimited("triggering pc sample trap for vmid %d\n", target_vmid);
+			node->kfd2kgd->trigger_pc_sample_trap(adev, target_vmid,
 					&node->pcs_data.hosttrap_entry.target_simd,
 					&node->pcs_data.hosttrap_entry.target_wave_slot,
 					node->pcs_data.hosttrap_entry.base.pc_sample_info.method,
@@ -257,6 +264,9 @@ static int kfd_pc_sample_start(struct kfd_process_device *pdd,
 		if (!pdd->dev->pcs_data.hosttrap_entry.base.active_count)
 			pc_sampling_start = true;
 
+		pdd->dev->pcs_data.hosttrap_entry.target_vmid = pdd->qpd.vmid;
+		pr_warn("pcs hosttrap: set target vmid=%u\n",
+			pdd->dev->pcs_data.hosttrap_entry.target_vmid);
 		pdd->dev->pcs_data.hosttrap_entry.base.active_count++;
 	} else { /* KFD_IOCTL_PCS_METHOD_STOCHASTIC */
 		if (!pdd->dev->pcs_data.stoch_entry.base.active_count)

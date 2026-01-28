@@ -231,6 +231,7 @@ static int add_queue_mes(struct device_queue_manager *dqm, struct queue *q,
 	struct mes_add_queue_input queue_input;
 	int r, queue_type;
 	uint64_t wptr_addr_off;
+	static int add_queue_count = 0;
 
 	if (!dqm->sched_running || dqm->sched_halt)
 		return 0;
@@ -265,6 +266,14 @@ static int add_queue_mes(struct device_queue_manager *dqm, struct queue *q,
 	queue_input.tba_addr = qpd->tba_addr;
 	queue_input.tma_addr = qpd->tma_addr;
 	queue_input.trap_en = !kfd_dbg_has_cwsr_workaround(q->device);
+
+	add_queue_count++;
+	/* Log first few and periodic calls to avoid spam */
+	if (add_queue_count <= 5 || (add_queue_count % 100 == 0))
+		pr_warn("add_queue_mes[%d]: qid=%d tba=0x%llx tma=0x%llx trap_en=%d\n",
+			add_queue_count, q->properties.queue_id,
+			queue_input.tba_addr, queue_input.tma_addr,
+			queue_input.trap_en);
 	queue_input.skip_process_ctx_clear =
 		qpd->pqm->process->runtime_info.runtime_state == DEBUG_RUNTIME_STATE_ENABLED &&
 						(qpd->pqm->process->debug_trap_enabled ||
@@ -333,6 +342,7 @@ static int remove_all_kfd_queues_mes(struct device_queue_manager *dqm)
 	struct qcm_process_device *qpd;
 	struct queue *q;
 	int retval = 0;
+	int removed_count = 0;
 
 	list_for_each_entry(cur, &dqm->queues, list) {
 		qpd = cur->qpd;
@@ -346,10 +356,12 @@ static int remove_all_kfd_queues_mes(struct device_queue_manager *dqm)
 						dqm->dev->id);
 					return retval;
 				}
+				removed_count++;
 			}
 		}
 	}
 
+	pr_warn("remove_all_kfd_queues_mes: removed %d queues\n", removed_count);
 	return retval;
 }
 
@@ -360,9 +372,12 @@ static int add_all_kfd_queues_mes(struct device_queue_manager *dqm)
 	struct qcm_process_device *qpd;
 	struct queue *q;
 	int retval = 0;
+	int added_count = 0;
 
 	list_for_each_entry(cur, &dqm->queues, list) {
 		qpd = cur->qpd;
+		pr_warn("add_all_kfd_queues_mes: process qpd tba=0x%llx tma=0x%llx\n",
+			qpd->tba_addr, qpd->tma_addr);
 		list_for_each_entry(q, &qpd->queues_list, list) {
 			if (!q->properties.is_active)
 				continue;
@@ -374,9 +389,11 @@ static int add_all_kfd_queues_mes(struct device_queue_manager *dqm)
 					dqm->dev->id);
 				return retval;
 			}
+			added_count++;
 		}
 	}
 
+	pr_warn("add_all_kfd_queues_mes: added %d queues\n", added_count);
 	return retval;
 }
 
@@ -546,6 +563,9 @@ static void program_trap_handler_settings(struct device_queue_manager *dqm,
 	uint32_t xcc_mask = dqm->dev->xcc_mask;
 	int xcc_id;
 
+	pr_warn("program_trap_handler_settings: vmid=%u tba=0x%llx tma=0x%llx func=%p\n",
+		qpd->vmid, qpd->tba_addr, qpd->tma_addr,
+		dqm->dev->kfd2kgd->program_trap_handler_settings);
 	if (dqm->dev->kfd2kgd->program_trap_handler_settings)
 		for_each_inst(xcc_id, xcc_mask)
 			dqm->dev->kfd2kgd->program_trap_handler_settings(
@@ -585,6 +605,9 @@ static int allocate_vmid(struct device_queue_manager *dqm,
 
 	program_sh_mem_settings(dqm, qpd);
 
+	pr_warn("allocate_vmid: KFD_IS_SOC15=%d cwsr_enabled=%d tba=0x%llx tma=0x%llx\n",
+		KFD_IS_SOC15(dqm->dev), dqm->dev->kfd->cwsr_enabled,
+		qpd->tba_addr, qpd->tma_addr);
 	if (KFD_IS_SOC15(dqm->dev) && dqm->dev->kfd->cwsr_enabled)
 		program_trap_handler_settings(dqm, qpd);
 
@@ -2037,24 +2060,37 @@ static int create_queue_cpsch(struct device_queue_manager *dqm, struct queue *q,
 			const void *restore_mqd, const void *restore_ctl_stack)
 {
 	int retval;
+	bool vmid_allocated = false;
 	struct mqd_manager *mqd_mgr;
 
+	dqm_lock(dqm);
 	if (dqm->total_queue_count >= max_num_of_queues_per_device) {
 		pr_warn("Can't create new usermode queue because %d queues were already created\n",
 				dqm->total_queue_count);
 		retval = -EPERM;
-		goto out;
+		goto out_unlock;
 	}
 
 	if (q->properties.type == KFD_QUEUE_TYPE_SDMA ||
 		q->properties.type == KFD_QUEUE_TYPE_SDMA_XGMI ||
 		q->properties.type == KFD_QUEUE_TYPE_SDMA_BY_ENG_ID) {
-		dqm_lock(dqm);
 		retval = allocate_sdma_queue(dqm, q, qd ? &qd->sdma_id : NULL);
-		dqm_unlock(dqm);
 		if (retval)
-			goto out;
+			goto out_unlock;
 	}
+
+	if (qpd->vmid == 0 &&
+	    (q->properties.type == KFD_QUEUE_TYPE_COMPUTE ||
+	     q->properties.type == KFD_QUEUE_TYPE_DIQ)) {
+		retval = allocate_vmid(dqm, qpd, q);
+		if (retval)
+			goto out_unlock;
+		vmid_allocated = true;
+		pr_warn("cpsch: allocated vmid=%u tba=0x%llx tma=0x%llx for first queue\n",
+			qpd->vmid, qpd->tba_addr, qpd->tma_addr);
+	}
+	q->properties.vmid = qpd->vmid;
+	dqm_unlock(dqm);
 
 	retval = allocate_doorbell(qpd, q, qd ? &qd->doorbell_id : NULL);
 	if (retval)
@@ -2135,8 +2171,16 @@ out_deallocate_sdma_queue:
 		deallocate_sdma_queue(dqm, q);
 		dqm_unlock(dqm);
 	}
+	if (vmid_allocated) {
+		dqm_lock(dqm);
+		deallocate_vmid(dqm, qpd, q);
+		dqm_unlock(dqm);
+	}
 out:
 	return retval;
+out_unlock:
+	dqm_unlock(dqm);
+	goto out;
 }
 
 int amdkfd_fence_wait_timeout(struct device_queue_manager *dqm,
@@ -2176,15 +2220,25 @@ static int map_queues_cpsch(struct device_queue_manager *dqm)
 	struct device *dev = dqm->dev->adev->dev;
 	int retval;
 
-	if (!dqm->sched_running || dqm->sched_halt)
+	if (!dqm->sched_running || dqm->sched_halt) {
+		pr_warn("map_queues_cpsch: early return (sched_running=%d sched_halt=%d)\n",
+			dqm->sched_running, dqm->sched_halt);
 		return 0;
-	if (dqm->active_queue_count <= 0 || dqm->processes_count <= 0)
+	}
+	if (dqm->active_queue_count <= 0 || dqm->processes_count <= 0) {
+		pr_warn("map_queues_cpsch: early return (queue_count=%d processes=%d)\n",
+			dqm->active_queue_count, dqm->processes_count);
 		return 0;
-	if (dqm->active_runlist)
+	}
+	if (dqm->active_runlist) {
+		pr_warn("map_queues_cpsch: early return (active_runlist=true)\n");
 		return 0;
+	}
 
+	pr_warn("map_queues_cpsch: sending runlist (queue_count=%d processes=%d)\n",
+		dqm->active_queue_count, dqm->processes_count);
 	retval = pm_send_runlist(&dqm->packet_mgr, &dqm->queues);
-	pr_debug("%s sent runlist\n", __func__);
+	pr_warn("%s sent runlist, retval=%d\n", __func__, retval);
 	if (retval) {
 		dev_err(dev, "failed to execute runlist\n");
 		return retval;
@@ -2639,6 +2693,8 @@ static int destroy_queue_cpsch(struct device_queue_manager *dqm,
 	}
 	list_del(&q->list);
 	qpd->queue_count--;
+	if (qpd->queue_count == 0 && qpd->vmid != 0 && !qpd->is_debug)
+		deallocate_vmid(dqm, qpd, q);
 
 	/*
 	 * Unconditionally decrement this counter, regardless of the queue's
@@ -3681,9 +3737,31 @@ void remap_queue(struct device_queue_manager *dqm,
 				enum kfd_unmap_queues_filter filter,
 				uint32_t filter_param)
 {
+	int ret;
+
 	dqm_lock(dqm);
-	if (!dqm->dev->kfd->shared_resources.enable_mes)
+	pr_warn("remap_queue: enable_mes=%d\n",
+		dqm->dev->kfd->shared_resources.enable_mes);
+	if (!dqm->dev->kfd->shared_resources.enable_mes) {
 		execute_queues_cpsch(dqm, filter, filter_param, USE_DEFAULT_GRACE_PERIOD);
+	} else {
+		/*
+		 * For MES: remove all queues and re-add them with updated
+		 * TBA/TMA. This is needed because MES gets TBA/TMA from
+		 * add_queue_mes, not from direct register programming.
+		 */
+		ret = remove_all_kfd_queues_mes(dqm);
+		if (ret) {
+			pr_warn("remap_queue: remove_all_kfd_queues_mes failed %d\n", ret);
+			goto out;
+		}
+		ret = add_all_kfd_queues_mes(dqm);
+		if (ret)
+			pr_warn("remap_queue: add_all_kfd_queues_mes failed %d\n", ret);
+		else
+			pr_warn("remap_queue: MES queues remapped successfully\n");
+	}
+out:
 	dqm_unlock(dqm);
 }
 

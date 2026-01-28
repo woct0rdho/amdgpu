@@ -30,6 +30,7 @@
 #include "soc15d.h"
 #include "v11_structs.h"
 #include "soc21.h"
+#include "soc21_enum.h"
 #include <uapi/linux/kfd_ioctl.h>
 
 enum hqd_dequeue_request_type {
@@ -806,6 +807,159 @@ static uint32_t kgd_gfx_v11_hqd_sdma_get_doorbell(struct amdgpu_device *adev,
 	return 0;
 }
 
+static uint32_t kgd_gfx_v11_get_hosttrap_status(struct amdgpu_device *adev,
+		uint32_t inst)
+{
+	uint32_t sq_debug_hosttrap_status = 0x0;
+	int i, j;
+
+	mutex_lock(&adev->grbm_idx_mutex);
+	for (i = 0; i < adev->gfx.config.max_shader_engines; i++) {
+		for (j = 0; j < adev->gfx.config.max_sh_per_se; j++) {
+			amdgpu_gfx_select_se_sh(adev, i, j, 0xffffffff, inst);
+			sq_debug_hosttrap_status =
+				RREG32_SOC15(GC, GET_INST(GC, inst), regSQ_DEBUG_HOST_TRAP_STATUS);
+
+			if (sq_debug_hosttrap_status)
+				goto out;
+		}
+	}
+
+out:
+	amdgpu_gfx_select_se_sh(adev, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, inst);
+	mutex_unlock(&adev->grbm_idx_mutex);
+
+	return sq_debug_hosttrap_status;
+}
+
+static void program_trap_handler_settings_v11(struct amdgpu_device *adev,
+		uint32_t vmid, uint64_t tba_addr, uint64_t tma_addr,
+		uint32_t inst)
+{
+	uint32_t tba_lo, tba_hi, tma_lo, tma_hi, gdbg_cntl;
+
+	dev_info(adev->dev, "program_trap_handler_settings_v11: vmid=%u tba=0x%llx tma=0x%llx inst=%u\n",
+		 vmid, tba_addr, tma_addr, inst);
+	lock_srbm(adev, 0, 0, 0, vmid);
+
+	/*
+	 * Program TBA registers
+	 */
+	WREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TBA_LO,
+		     lower_32_bits(tba_addr >> 8));
+	WREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TBA_HI,
+		     upper_32_bits(tba_addr >> 8) |
+		     (1 << SQ_SHADER_TBA_HI__TRAP_EN__SHIFT));
+
+	/*
+	 * Program TMA registers
+	 */
+	WREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TMA_LO,
+		     lower_32_bits(tma_addr >> 8));
+	WREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TMA_HI,
+		     upper_32_bits(tma_addr >> 8));
+
+	/*
+	 * Force enable TRAP_EN in SPI_GDBG_PER_VMID_CNTL.
+	 * This is required for HostTrap (SQ_CMD) to work on GFX11.
+	 */
+	WREG32_SOC15(GC, GET_INST(GC, inst), regSPI_GDBG_PER_VMID_CNTL,
+		     REG_SET_FIELD(0, SPI_GDBG_PER_VMID_CNTL, TRAP_EN, 1));
+
+	/* Read back to verify programming (first vmid programmed only) */
+	{
+		tba_lo = RREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TBA_LO);
+		tba_hi = RREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TBA_HI);
+		tma_lo = RREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TMA_LO);
+		tma_hi = RREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TMA_HI);
+		gdbg_cntl = RREG32_SOC15(GC, GET_INST(GC, inst), regSPI_GDBG_PER_VMID_CNTL);
+		dev_info(adev->dev,
+			 "readback vmid=%u: TBA=0x%x_%x TMA=0x%x_%x GDBG_CNTL=0x%x TRAP_EN=%d\n",
+			 vmid, tba_hi, tba_lo, tma_hi, tma_lo, gdbg_cntl,
+			 !!(tba_hi & (1 << SQ_SHADER_TBA_HI__TRAP_EN__SHIFT)));
+	}
+
+	unlock_srbm(adev);
+}
+
+static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
+					    uint32_t vmid,
+					    uint32_t *target_simd,
+					    uint32_t *target_wave_slot,
+					    enum kfd_ioctl_pc_sample_method method,
+					    uint32_t inst)
+{
+	static int trigger_count = 0;
+	uint32_t max_simd = adev->gfx.cu_info.simd_per_cu;
+	uint32_t max_wave_slot = adev->gfx.cu_info.max_waves_per_simd;
+	uint32_t combined_wave_id;
+	uint32_t wave_id_mask = 0x1F;
+
+	if (!max_simd)
+		max_simd = 4;
+	if (!max_wave_slot)
+		max_wave_slot = 16;
+	if (max_wave_slot > 16)
+		max_wave_slot = 16;
+
+	if (method == KFD_IOCTL_PCS_METHOD_HOSTTRAP) {
+		uint32_t value = 0;
+		uint32_t sq_hosttrap_status = 0x0;
+
+		sq_hosttrap_status = kgd_gfx_v11_get_hosttrap_status(adev, inst);
+		trigger_count++;
+		if (trigger_count <= 5 || (trigger_count % 1000 == 0))
+			dev_info(adev->dev,
+				 "trigger_pc_sample_trap: count=%d status=0x%x simd=%u wave_slot=%u max_simd=%u max_wave=%u\n",
+				 trigger_count, sq_hosttrap_status, *target_simd, *target_wave_slot,
+				 max_simd, max_wave_slot);
+		/* skip when last host trap request is still pending to complete */
+		if (sq_hosttrap_status)
+			return 0;
+
+		combined_wave_id = (*target_simd * max_wave_slot) + *target_wave_slot;
+		combined_wave_id &= wave_id_mask;
+
+		value = REG_SET_FIELD(value, SQ_CMD, CMD, SQ_IND_CMD_CMD_TRAP);
+		value = REG_SET_FIELD(value, SQ_CMD, MODE, SQ_IND_CMD_MODE_SINGLE);
+		value = REG_SET_FIELD(value, SQ_CMD, WAVE_ID, combined_wave_id);
+		/* set TrapID 4 for HOSTTRAP */
+		value = REG_SET_FIELD(value, SQ_CMD, DATA, 0x4);
+		/* Filter by vmid — required to avoid trapping other VMIDs' waves */
+		value = REG_SET_FIELD(value, SQ_CMD, VM_ID, vmid);
+		value = REG_SET_FIELD(value, SQ_CMD, CHECK_VMID, 1);
+
+		mutex_lock(&adev->grbm_idx_mutex);
+		amdgpu_gfx_select_se_sh(adev, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, inst);
+		if (trigger_count <= 5 || (trigger_count % 1000 == 0))
+			dev_info(adev->dev, "trigger_pc_sample_trap: SQ_CMD=0x%08x vmid=%u\n",
+				 value, vmid);
+		WREG32_SOC15(GC, GET_INST(GC, inst), regSQ_CMD, value);
+		mutex_unlock(&adev->grbm_idx_mutex);
+
+		/* Check status after sending command (outside lock) */
+		if (trigger_count <= 3) {
+			uint32_t post_status;
+			udelay(100);  /* Brief delay for trap to propagate */
+			post_status = kgd_gfx_v11_get_hosttrap_status(adev, inst);
+			dev_info(adev->dev,
+				 "trigger_pc_sample_trap: post_status=0x%x (0=no pending trap)\n",
+				 post_status);
+		}
+
+		(*target_wave_slot)++;
+		if (*target_wave_slot >= max_wave_slot) {
+			*target_wave_slot = 0;
+			(*target_simd)++;
+			*target_simd %= max_simd;
+		}
+	} else {
+		dev_dbg(adev->dev, "PC Sampling method %d not supported.", method);
+		return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
 const struct kfd2kgd_calls gfx_v11_kfd2kgd = {
 	.program_sh_mem_settings = program_sh_mem_settings_v11,
 	.set_pasid_vmid_mapping = set_pasid_vmid_mapping_v11,
@@ -829,7 +983,9 @@ const struct kfd2kgd_calls gfx_v11_kfd2kgd = {
 	.set_wave_launch_mode = kgd_gfx_v11_set_wave_launch_mode,
 	.set_address_watch = kgd_gfx_v11_set_address_watch,
 	.clear_address_watch = kgd_gfx_v11_clear_address_watch,
+	.program_trap_handler_settings = program_trap_handler_settings_v11,
 	.hqd_get_pq_addr = kgd_gfx_v11_hqd_get_pq_addr,
 	.hqd_reset = kgd_gfx_v11_hqd_reset,
-	.hqd_sdma_get_doorbell = kgd_gfx_v11_hqd_sdma_get_doorbell
+	.hqd_sdma_get_doorbell = kgd_gfx_v11_hqd_sdma_get_doorbell,
+	.trigger_pc_sample_trap = kgd_gfx_v11_trigger_pc_sample_trap
 };

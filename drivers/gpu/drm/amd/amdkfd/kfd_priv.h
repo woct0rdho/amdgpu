@@ -303,6 +303,7 @@ struct kfd_dev_pcs_hosttrap {
 	struct kfd_dev_pc_sampling_data base;
 	uint32_t target_simd;       /* target simd for trap */
 	uint32_t target_wave_slot;  /* target wave slot for trap */
+	uint32_t target_vmid;       /* target vmid for host trap */
 	struct task_struct *pc_sample_thread;
 };
 
