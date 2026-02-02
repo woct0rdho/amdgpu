@@ -1,6 +1,3 @@
-/*
- * This file is managed by DKMS build. Do not edit.
- */
 #define HAVE_CHIP_TAHITI
 #define HAVE_CHIP_PITCAIRN
 #define HAVE_CHIP_VERDE
