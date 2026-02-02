@@ -24,6 +24,7 @@
 #include <linux/debugfs.h>
 #include <linux/list.h>
 #include <linux/module.h>
+#include <linux/version.h>
 #include <linux/uaccess.h>
 #include <linux/reboot.h>
 #include <linux/syscalls.h>
@@ -2306,6 +2307,8 @@ static int amdgpu_ras_fs_init(struct amdgpu_device *adev)
 	};
 #ifdef HAVE_ATTRIBUTE_GROUP_BIN_ATTRS_NEW
 	const struct bin_attribute *bin_attrs[] = {
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+	const struct bin_attribute *bin_attrs[] = {
 #else
 	struct bin_attribute *bin_attrs[] = {
 #endif
@@ -2339,6 +2342,8 @@ static int amdgpu_ras_fs_init(struct amdgpu_device *adev)
 		bin_attrs[0] = &con->badpages_attr;
 #ifdef HAVE_ATTRIBUTE_GROUP_BIN_ATTRS_NEW
 		group.bin_attrs_new = bin_attrs;
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+		group.bin_attrs = bin_attrs;
 #else
 		group.bin_attrs = bin_attrs;
 #endif

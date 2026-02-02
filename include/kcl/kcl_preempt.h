@@ -1,6 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef AMDKCL_PREEMPT_H
 #define AMDKCL_PREEMPT_H
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+#define HAVE_MIGRATE_DISABLE 1
+#endif
 #include <linux/preempt.h>
 
 #ifndef in_task
