@@ -182,3 +182,5 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+
+/amdgpu-dkms/
