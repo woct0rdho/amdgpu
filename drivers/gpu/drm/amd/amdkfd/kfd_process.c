@@ -1527,6 +1527,7 @@ void kfd_process_set_trap_handler(struct qcm_process_device *qpd,
 
 	pr_warn("kfd_process_set_trap_handler: cwsr_kaddr=%p tba=0x%llx tma=0x%llx\n",
 		qpd->cwsr_kaddr, tba_addr, tma_addr);
+#if 0 /* DISABLED: Testing — don't update qpd TBA/TMA at all */
 	if (qpd->cwsr_kaddr) {
 		/* KFD trap handler is bound, record as second-level TBA/TMA
 		 * in first-level TMA. First-level trap will jump to second.
@@ -1545,6 +1546,10 @@ void kfd_process_set_trap_handler(struct qcm_process_device *qpd,
 		qpd->tma_addr = tma_addr;
 		pr_warn("kfd_process_set_trap_handler: stored as first-level (no CWSR)\n");
 	}
+#else
+	pr_warn("kfd_process_set_trap_handler: COMPLETE NO-OP — not storing TBA/TMA (debug)\n");
+	return;
+#endif
 
 	if (qpd->tba_addr && qpd->tma_addr &&
 	    dqm && dqm->dev && dqm->dev->kfd2kgd->program_trap_handler_settings) {
@@ -1558,12 +1563,17 @@ void kfd_process_set_trap_handler(struct qcm_process_device *qpd,
 		 * MES handles TBA/TMA for context switches via add_queue_mes.
 		 */
 		if (qpd->vmid >= dqm->dev->vm_info.first_vmid_kfd) {
+#if 0 /* DISABLED: Testing whether SRBM programming causes page fault */
 			for_each_inst(xcc_id, xcc_mask)
 				dqm->dev->kfd2kgd->program_trap_handler_settings(
 					dqm->dev->adev, qpd->vmid,
 					qpd->tba_addr, qpd->tma_addr, xcc_id);
 			pr_warn("kfd_process_set_trap_handler: programmed TBA/TMA for vmid=%u\n",
 				qpd->vmid);
+#else
+			pr_warn("kfd_process_set_trap_handler: SKIPPED SRBM programming for vmid=%u (debug)\n",
+				qpd->vmid);
+#endif
 		} else {
 			pr_warn("kfd_process_set_trap_handler: vmid=%u not yet allocated, skipping SRBM\n",
 				qpd->vmid);
@@ -1573,8 +1583,12 @@ void kfd_process_set_trap_handler(struct qcm_process_device *qpd,
 		 * with updated TBA/TMA to the MES. Without this, the MES
 		 * won't know about the trap handler after context switches.
 		 */
+#if 0 /* DISABLED: Testing whether queue remap causes page fault */
 		remap_queue(dqm, KFD_UNMAP_QUEUES_FILTER_ALL_QUEUES, 0);
 		pr_warn("kfd_process_set_trap_handler: remapped queues\n");
+#else
+		pr_warn("kfd_process_set_trap_handler: SKIPPED queue remap (debug)\n");
+#endif
 	}
 }
 

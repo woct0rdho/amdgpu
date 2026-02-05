@@ -1153,6 +1153,7 @@ void kfd_dbg_set_enabled_debug_exception_mask(struct kfd_process *target,
 
 void kfd_dbg_enable_ttmp_setup(struct kfd_process *p)
 {
+#if 0 /* DISABLED: Testing whether TRAP_EN in MAP_PROCESS causes page fault */
 	int i;
 
 	if (p->runtime_info.ttmp_setup)
@@ -1175,4 +1176,7 @@ void kfd_dbg_enable_ttmp_setup(struct kfd_process *p)
 					0);
 		}
 	}
+#else
+	pr_warn("kfd_dbg_enable_ttmp_setup: SKIPPED (debug) — spi_dbg_override stays 0\n");
+#endif
 }

@@ -903,6 +903,7 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 		max_wave_slot = 16;
 
 	if (method == KFD_IOCTL_PCS_METHOD_HOSTTRAP) {
+#if 0 /* DISABLED: Testing whether fault comes from SQ_CMD or from setup */
 		uint32_t value = 0;
 		uint32_t sq_hosttrap_status = 0x0;
 
@@ -953,6 +954,14 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 			(*target_simd)++;
 			*target_simd %= max_simd;
 		}
+#else
+		/* NO-OP: Skip SQ_CMD entirely. Tests if fault is from setup vs trigger. */
+		trigger_count++;
+		if (trigger_count <= 5 || (trigger_count % 1000 == 0))
+			dev_info(adev->dev,
+				 "trigger_pc_sample_trap: NOOP count=%d vmid=%u (SQ_CMD disabled)\n",
+				 trigger_count, vmid);
+#endif
 	} else {
 		dev_dbg(adev->dev, "PC Sampling method %d not supported.", method);
 		return -EOPNOTSUPP;
