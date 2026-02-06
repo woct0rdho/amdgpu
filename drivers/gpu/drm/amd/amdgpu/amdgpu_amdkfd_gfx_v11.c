@@ -33,6 +33,42 @@
 #include "soc21_enum.h"
 #include <uapi/linux/kfd_ioctl.h>
 
+enum amdkfd_gfx11_pcs_sqcmd_policy {
+	/* Variant A: MODE_SINGLE + CHECK_VMID=1 + queue_id=0 + wave_id sweep */
+	AMDKFD_GFX11_PCS_SQCMD_SINGLE_Q0 = 0,
+	/* Current policy: MODE_SINGLE + CHECK_VMID=1 + queue_id/wave_id sweep */
+	AMDKFD_GFX11_PCS_SQCMD_SINGLE_QUEUE_SWEEP = 1,
+	/* Variant B: MODE_BROADCAST, no queue/wave/vmid targeting (gfx12-like) */
+	AMDKFD_GFX11_PCS_SQCMD_BROADCAST = 2,
+	/* Variant C: MODE_SINGLE + CHECK_VMID=0 + queue_id/wave_id sweep */
+	AMDKFD_GFX11_PCS_SQCMD_SINGLE_QUEUE_SWEEP_NO_VMID_CHECK = 3,
+};
+
+static int amdkfd_gfx11_pcs_sqcmd_policy =
+	AMDKFD_GFX11_PCS_SQCMD_SINGLE_QUEUE_SWEEP;
+module_param_named(amdkfd_gfx11_pcs_sqcmd_policy,
+		   amdkfd_gfx11_pcs_sqcmd_policy, int, 0644);
+MODULE_PARM_DESC(amdkfd_gfx11_pcs_sqcmd_policy,
+		 "gfx11 PC sampling SQ_CMD policy: "
+		 "0=single_q0, 1=single_queue_sweep, 2=broadcast, "
+		 "3=single_queue_sweep_no_vmid_check");
+
+static const char *kgd_gfx_v11_pcs_sqcmd_policy_name(int policy)
+{
+	switch (policy) {
+	case AMDKFD_GFX11_PCS_SQCMD_SINGLE_Q0:
+		return "single_q0";
+	case AMDKFD_GFX11_PCS_SQCMD_SINGLE_QUEUE_SWEEP:
+		return "single_queue_sweep";
+	case AMDKFD_GFX11_PCS_SQCMD_BROADCAST:
+		return "broadcast";
+	case AMDKFD_GFX11_PCS_SQCMD_SINGLE_QUEUE_SWEEP_NO_VMID_CHECK:
+		return "single_queue_sweep_no_vmid_check";
+	default:
+		return "invalid";
+	}
+}
+
 enum hqd_dequeue_request_type {
 	NO_ACTION = 0,
 	DRAIN_PIPE,
@@ -907,11 +943,16 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 		static uint32_t last_status = 0xFFFFFFFF;
 		static bool cap_logged = false;
 		const uint32_t max_injected_traps = 512;
+		int policy = amdkfd_gfx11_pcs_sqcmd_policy;
+		const char *policy_name = kgd_gfx_v11_pcs_sqcmd_policy_name(policy);
 		uint32_t value = 0;
 		uint32_t sq_hosttrap_status = 0x0;
 		uint32_t cmd = SQ_IND_CMD_CMD_TRAP;
 		uint32_t mode = SQ_IND_CMD_MODE_SINGLE;
 		uint32_t check_vmid = 1;
+		bool set_wave_id = true;
+		bool set_queue_id = true;
+		bool set_vmid = true;
 		uint32_t queue_id = 0;
 		uint32_t wave_id = 0;
 
@@ -924,13 +965,50 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 			last_status = 0xFFFFFFFF;
 			cap_logged = false;
 			dev_info(adev->dev,
-				 "trigger_pc_sample_trap: reset state for vmid=%u\n", vmid);
+				 "trigger_pc_sample_trap: reset state for vmid=%u policy=%s(%d)\n",
+				 vmid, policy_name, policy);
 		}
 		trigger_count++;
 
-		/* Deterministic host-trap trigger mode: single-wave + queue sweep. */
-		wave_id = ((*target_simd * max_wave_slot) + *target_wave_slot) & 0x1F;
-		queue_id = (trigger_count - 1) & 0x7;
+		/* Select SQ_CMD trigger policy for A/B/C isolation. */
+		switch (policy) {
+		case AMDKFD_GFX11_PCS_SQCMD_SINGLE_Q0:
+			mode = SQ_IND_CMD_MODE_SINGLE;
+			check_vmid = 1;
+			wave_id = ((*target_simd * max_wave_slot) + *target_wave_slot) & 0x1F;
+			queue_id = 0;
+			break;
+		case AMDKFD_GFX11_PCS_SQCMD_SINGLE_QUEUE_SWEEP:
+			mode = SQ_IND_CMD_MODE_SINGLE;
+			check_vmid = 1;
+			wave_id = ((*target_simd * max_wave_slot) + *target_wave_slot) & 0x1F;
+			queue_id = (trigger_count - 1) & 0x7;
+			break;
+		case AMDKFD_GFX11_PCS_SQCMD_BROADCAST:
+			mode = SQ_IND_CMD_MODE_BROADCAST;
+			check_vmid = 0;
+			set_wave_id = false;
+			set_queue_id = false;
+			set_vmid = false;
+			wave_id = 0;
+			queue_id = 0;
+			break;
+		case AMDKFD_GFX11_PCS_SQCMD_SINGLE_QUEUE_SWEEP_NO_VMID_CHECK:
+			mode = SQ_IND_CMD_MODE_SINGLE;
+			check_vmid = 0;
+			wave_id = ((*target_simd * max_wave_slot) + *target_wave_slot) & 0x1F;
+			queue_id = (trigger_count - 1) & 0x7;
+			break;
+		default:
+			mode = SQ_IND_CMD_MODE_SINGLE;
+			check_vmid = 1;
+			wave_id = ((*target_simd * max_wave_slot) + *target_wave_slot) & 0x1F;
+			queue_id = (trigger_count - 1) & 0x7;
+			policy = AMDKFD_GFX11_PCS_SQCMD_SINGLE_QUEUE_SWEEP;
+			policy_name = kgd_gfx_v11_pcs_sqcmd_policy_name(policy);
+			break;
+		}
+
 		log_this_call = (trigger_count <= 20) || (trigger_count % 500 == 0);
 		if (log_this_call || (trigger_count % 1000 == 0))
 			dev_info(adev->dev,
@@ -958,18 +1036,21 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 
 		value = REG_SET_FIELD(value, SQ_CMD, CMD, cmd);
 		value = REG_SET_FIELD(value, SQ_CMD, MODE, mode);
-		value = REG_SET_FIELD(value, SQ_CMD, WAVE_ID, wave_id);
+		if (set_wave_id)
+			value = REG_SET_FIELD(value, SQ_CMD, WAVE_ID, wave_id);
 		/* set TrapID 4 for HOSTTRAP */
 		value = REG_SET_FIELD(value, SQ_CMD, DATA, 0x4);
-		value = REG_SET_FIELD(value, SQ_CMD, QUEUE_ID, queue_id);
-		value = REG_SET_FIELD(value, SQ_CMD, VM_ID, vmid);
+		if (set_queue_id)
+			value = REG_SET_FIELD(value, SQ_CMD, QUEUE_ID, queue_id);
+		if (set_vmid)
+			value = REG_SET_FIELD(value, SQ_CMD, VM_ID, vmid);
 		value = REG_SET_FIELD(value, SQ_CMD, CHECK_VMID, check_vmid);
 
 		if (log_this_call || (trigger_count % 1000 == 0))
 			dev_info(adev->dev,
-				 "trigger_pc_sample_trap: SQ_CMD=0x%08x vmid=%u cmd=%u mode=%u check_vmid=%u wave_id=%u queue_id=%u simd=%u wave_slot=%u policy=single_queue_sweep\n",
+				 "trigger_pc_sample_trap: SQ_CMD=0x%08x vmid=%u cmd=%u mode=%u check_vmid=%u wave_id=%u queue_id=%u simd=%u wave_slot=%u policy=%s\n",
 				 value, vmid, cmd, mode, check_vmid, wave_id, queue_id,
-				 *target_simd, *target_wave_slot);
+				 *target_simd, *target_wave_slot, policy_name);
 
 		/* Use direct SQ_CMD write path (same style as gfx12) for host-trap testing. */
 		mutex_lock(&adev->grbm_idx_mutex);
