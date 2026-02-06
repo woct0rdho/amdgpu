@@ -1586,6 +1586,19 @@ void kfd_process_set_trap_handler(struct qcm_process_device *qpd,
 #if 1 /* Re-enabled: Test 21m */
 		remap_queue(dqm, KFD_UNMAP_QUEUES_FILTER_ALL_QUEUES, 0);
 		pr_warn("kfd_process_set_trap_handler: remapped queues\n");
+
+		/* DEBUG: Readback TBA/TMA AFTER MES remap to check if MES overwrote them */
+		if (qpd->vmid >= dqm->dev->vm_info.first_vmid_kfd &&
+		    dqm->dev->kfd2kgd->program_trap_handler_settings) {
+			/* Re-read via SRBM to see what MES left in the registers */
+			for_each_inst(xcc_id, xcc_mask) {
+				dqm->dev->kfd2kgd->program_trap_handler_settings(
+					dqm->dev->adev, qpd->vmid,
+					qpd->tba_addr, qpd->tma_addr, xcc_id);
+			}
+			pr_warn("kfd_process_set_trap_handler: re-programmed TBA/TMA after remap for vmid=%u\n",
+				qpd->vmid);
+		}
 #else
 		pr_warn("kfd_process_set_trap_handler: SKIPPED queue remap (debug)\n");
 #endif

@@ -111,12 +111,19 @@ static int kfd_pc_sample_thread(void *param)
 			next_trap_time = ktime_add_us(ktime_get_raw(), timeout);
 
 			for_each_inst(inst, node->xcc_mask) {
-			pr_warn_ratelimited("triggering pc sample trap for vmid %d\n", target_vmid);
-			node->kfd2kgd->trigger_pc_sample_trap(adev, target_vmid,
+				int ret;
+
+				ret = node->kfd2kgd->trigger_pc_sample_trap(adev, target_vmid,
 					&node->pcs_data.hosttrap_entry.target_simd,
 					&node->pcs_data.hosttrap_entry.target_wave_slot,
 					node->pcs_data.hosttrap_entry.base.pc_sample_info.method,
 					inst);
+				if (ret)
+					pr_warn_ratelimited("pc sample trigger failed vmid=%d inst=%u ret=%d method=%u simd=%u wave_slot=%u\n",
+						target_vmid, inst, ret,
+						node->pcs_data.hosttrap_entry.base.pc_sample_info.method,
+						node->pcs_data.hosttrap_entry.target_simd,
+						node->pcs_data.hosttrap_entry.target_wave_slot);
 			}
 			pr_debug_ratelimited("triggered a host trap.");
 			need_wait = true;

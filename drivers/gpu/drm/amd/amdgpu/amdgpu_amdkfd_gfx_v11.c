@@ -892,8 +892,7 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 	static int trigger_count = 0;
 	uint32_t max_simd = adev->gfx.cu_info.simd_per_cu;
 	uint32_t max_wave_slot = adev->gfx.cu_info.max_waves_per_simd;
-	uint32_t combined_wave_id;
-	uint32_t wave_id_mask = 0x1F;
+	bool log_this_call = false;
 
 	if (!max_simd)
 		max_simd = 4;
@@ -904,48 +903,105 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 
 	if (method == KFD_IOCTL_PCS_METHOD_HOSTTRAP) {
 #if 1 /* Re-enabled: Test 21m */
+		static uint32_t last_vmid = 0xFFFFFFFF;
+		static uint32_t last_status = 0xFFFFFFFF;
 		uint32_t value = 0;
 		uint32_t sq_hosttrap_status = 0x0;
+		uint32_t cmd = SQ_IND_CMD_CMD_TRAP;
+		uint32_t mode = SQ_IND_CMD_MODE_BROADCAST;
+		uint32_t check_vmid = 1;
+		uint32_t wave_id = 0;
+		uint32_t queue_id = 0;
+		uint32_t combined_wave_id = 0;
+		bool use_broadcast = true;
 
 		sq_hosttrap_status = kgd_gfx_v11_get_hosttrap_status(adev, inst);
+		if (vmid != last_vmid) {
+			trigger_count = 0;
+			*target_simd = 0;
+			*target_wave_slot = 0;
+			last_vmid = vmid;
+			last_status = 0xFFFFFFFF;
+			dev_info(adev->dev,
+				 "trigger_pc_sample_trap: reset state for vmid=%u\n", vmid);
+		}
 		trigger_count++;
-		if (trigger_count <= 5 || (trigger_count % 1000 == 0))
+		combined_wave_id = (*target_simd * max_wave_slot) + *target_wave_slot;
+		combined_wave_id &= 0x1F;
+		queue_id = (trigger_count - 1) & 0x7;
+		/*
+		 * Trigger policy for isolation:
+		 * - always filter by VMID to avoid cross-VMID side effects
+		 * - early phase: broadcast to maximize chance of hitting active wave
+		 * - later: alternate broadcast and single-wave sweep
+		 */
+		use_broadcast = (trigger_count <= 256) || ((trigger_count & 0x1) == 0);
+		if (use_broadcast) {
+			mode = SQ_IND_CMD_MODE_BROADCAST;
+			wave_id = 0;
+		} else {
+			mode = SQ_IND_CMD_MODE_SINGLE;
+			wave_id = combined_wave_id;
+		}
+
+		/*
+		 * Deterministic host-trap trigger mode:
+		 * - CMD=TRAP (5)
+		 * - VMID filter ON
+		 * - broadcast-first, then broadcast/single alternation
+		 * - queue_id sweep 0..7
+		 */
+		log_this_call = (trigger_count <= 20) || (trigger_count % 500 == 0);
+		if (log_this_call || (trigger_count % 1000 == 0))
 			dev_info(adev->dev,
 				 "trigger_pc_sample_trap: count=%d status=0x%x simd=%u wave_slot=%u max_simd=%u max_wave=%u\n",
 				 trigger_count, sq_hosttrap_status, *target_simd, *target_wave_slot,
 				 max_simd, max_wave_slot);
+		if (sq_hosttrap_status != last_status) {
+			dev_info(adev->dev,
+				 "trigger_pc_sample_trap: status transition vmid=%u 0x%x -> 0x%x\n",
+				 vmid, last_status, sq_hosttrap_status);
+			last_status = sq_hosttrap_status;
+		}
 		/* skip when last host trap request is still pending to complete */
 		if (sq_hosttrap_status)
 			return 0;
 
-		combined_wave_id = (*target_simd * max_wave_slot) + *target_wave_slot;
-		combined_wave_id &= wave_id_mask;
-
-		value = REG_SET_FIELD(value, SQ_CMD, CMD, SQ_IND_CMD_CMD_TRAP);
-		value = REG_SET_FIELD(value, SQ_CMD, MODE, SQ_IND_CMD_MODE_SINGLE);
-		value = REG_SET_FIELD(value, SQ_CMD, WAVE_ID, combined_wave_id);
+		value = REG_SET_FIELD(value, SQ_CMD, CMD, cmd);
+		value = REG_SET_FIELD(value, SQ_CMD, MODE, mode);
+		value = REG_SET_FIELD(value, SQ_CMD, WAVE_ID, wave_id);
 		/* set TrapID 4 for HOSTTRAP */
 		value = REG_SET_FIELD(value, SQ_CMD, DATA, 0x4);
-		/* Filter by vmid — required to avoid trapping other VMIDs' waves */
+		value = REG_SET_FIELD(value, SQ_CMD, QUEUE_ID, queue_id);
 		value = REG_SET_FIELD(value, SQ_CMD, VM_ID, vmid);
-		value = REG_SET_FIELD(value, SQ_CMD, CHECK_VMID, 1);
+		value = REG_SET_FIELD(value, SQ_CMD, CHECK_VMID, check_vmid);
 
+		if (log_this_call || (trigger_count % 1000 == 0))
+			dev_info(adev->dev,
+				 "trigger_pc_sample_trap: SQ_CMD=0x%08x vmid=%u cmd=%u mode=%u check_vmid=%u wave_id=%u queue_id=%u policy=%s\n",
+				 value, vmid, cmd, mode, check_vmid, wave_id, queue_id,
+				 use_broadcast ? "broadcast" : "single");
+
+		/* Use direct SQ_CMD write path (same style as gfx12) for host-trap testing. */
 		mutex_lock(&adev->grbm_idx_mutex);
 		amdgpu_gfx_select_se_sh(adev, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, inst);
-		if (trigger_count <= 5 || (trigger_count % 1000 == 0))
-			dev_info(adev->dev, "trigger_pc_sample_trap: SQ_CMD=0x%08x vmid=%u\n",
-				 value, vmid);
 		WREG32_SOC15(GC, GET_INST(GC, inst), regSQ_CMD, value);
 		mutex_unlock(&adev->grbm_idx_mutex);
 
 		/* Check status after sending command (outside lock) */
-		if (trigger_count <= 3) {
+		if (log_this_call) {
 			uint32_t post_status;
 			udelay(100);  /* Brief delay for trap to propagate */
 			post_status = kgd_gfx_v11_get_hosttrap_status(adev, inst);
 			dev_info(adev->dev,
 				 "trigger_pc_sample_trap: post_status=0x%x (0=no pending trap)\n",
 				 post_status);
+			if (post_status != last_status) {
+				dev_info(adev->dev,
+					 "trigger_pc_sample_trap: post-status transition vmid=%u 0x%x -> 0x%x\n",
+					 vmid, last_status, post_status);
+				last_status = post_status;
+			}
 		}
 
 		(*target_wave_slot)++;
