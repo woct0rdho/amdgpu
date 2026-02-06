@@ -1527,7 +1527,7 @@ void kfd_process_set_trap_handler(struct qcm_process_device *qpd,
 
 	pr_warn("kfd_process_set_trap_handler: cwsr_kaddr=%p tba=0x%llx tma=0x%llx\n",
 		qpd->cwsr_kaddr, tba_addr, tma_addr);
-#if 0 /* DISABLED: Testing — don't update qpd TBA/TMA at all */
+#if 1 /* Re-enabled: Test 21m */
 	if (qpd->cwsr_kaddr) {
 		/* KFD trap handler is bound, record as second-level TBA/TMA
 		 * in first-level TMA. First-level trap will jump to second.
@@ -1563,7 +1563,7 @@ void kfd_process_set_trap_handler(struct qcm_process_device *qpd,
 		 * MES handles TBA/TMA for context switches via add_queue_mes.
 		 */
 		if (qpd->vmid >= dqm->dev->vm_info.first_vmid_kfd) {
-#if 0 /* DISABLED: Testing whether SRBM programming causes page fault */
+#if 1 /* Re-enabled: Test 21m */
 			for_each_inst(xcc_id, xcc_mask)
 				dqm->dev->kfd2kgd->program_trap_handler_settings(
 					dqm->dev->adev, qpd->vmid,
@@ -1583,7 +1583,7 @@ void kfd_process_set_trap_handler(struct qcm_process_device *qpd,
 		 * with updated TBA/TMA to the MES. Without this, the MES
 		 * won't know about the trap handler after context switches.
 		 */
-#if 0 /* DISABLED: Testing whether queue remap causes page fault */
+#if 1 /* Re-enabled: Test 21m */
 		remap_queue(dqm, KFD_UNMAP_QUEUES_FILTER_ALL_QUEUES, 0);
 		pr_warn("kfd_process_set_trap_handler: remapped queues\n");
 #else

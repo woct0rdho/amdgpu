@@ -903,7 +903,7 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 		max_wave_slot = 16;
 
 	if (method == KFD_IOCTL_PCS_METHOD_HOSTTRAP) {
-#if 0 /* DISABLED: Testing whether fault comes from SQ_CMD or from setup */
+#if 1 /* Re-enabled: Test 21m */
 		uint32_t value = 0;
 		uint32_t sq_hosttrap_status = 0x0;
 
