@@ -42,6 +42,30 @@ enum amdkfd_gfx11_pcs_sqcmd_policy {
 	AMDKFD_GFX11_PCS_SQCMD_BROADCAST = 2,
 	/* Variant C: MODE_SINGLE + CHECK_VMID=0 + queue_id/wave_id sweep */
 	AMDKFD_GFX11_PCS_SQCMD_SINGLE_QUEUE_SWEEP_NO_VMID_CHECK = 3,
+	/* Probe mode: broadcast + low cap + disable after first nonzero post_status */
+	AMDKFD_GFX11_PCS_SQCMD_BROADCAST_PROBE = 4,
+	/* Queue-targeted broadcast (all waves in one queue) */
+	AMDKFD_GFX11_PCS_SQCMD_BROADCAST_QUEUE = 5,
+	/* Probe mode: broadcast_queue + low cap + disable after first nonzero post_status */
+	AMDKFD_GFX11_PCS_SQCMD_BROADCAST_QUEUE_PROBE = 6,
+	/* MODE_SINGLE + CHECK_VMID=1 + fixed queue_id=0 + fixed wave_id=0 */
+	AMDKFD_GFX11_PCS_SQCMD_SINGLE_FIXED_Q0_W0 = 7,
+	/* MODE_SINGLE + CHECK_VMID=1 + queue_id sweep + fixed wave_id=0 */
+	AMDKFD_GFX11_PCS_SQCMD_SINGLE_QUEUE_SWEEP_W0 = 8,
+	/* Control: do not emit SQ_CMD writes (status polling only) */
+	AMDKFD_GFX11_PCS_SQCMD_NOOP = 9,
+	/* MODE_BROADCAST_QUEUE + CHECK_VMID=0 + queue sweep */
+	AMDKFD_GFX11_PCS_SQCMD_BROADCAST_QUEUE_NO_VMID = 10,
+	/* Probe mode: broadcast_queue + CHECK_VMID=0 + low cap + auto-disable */
+	AMDKFD_GFX11_PCS_SQCMD_BROADCAST_QUEUE_NO_VMID_PROBE = 11,
+	/* MODE_SINGLE + CHECK_VMID=0 + wave sweep + no queue targeting */
+	AMDKFD_GFX11_PCS_SQCMD_SINGLE_WAVE_NO_QUEUE_NO_VMID = 12,
+	/* MODE_BROADCAST_QUEUE + CHECK_VMID=0 + queue+wave sweep + probe */
+	AMDKFD_GFX11_PCS_SQCMD_BROADCAST_QUEUE_WAVE_NO_VMID_PROBE = 13,
+	/* MODE_SINGLE + CHECK_VMID=1 + wave sweep + no queue targeting */
+	AMDKFD_GFX11_PCS_SQCMD_SINGLE_WAVE_NO_QUEUE = 14,
+	/* Probe mode: single + CHECK_VMID=1 + wave sweep + no queue targeting */
+	AMDKFD_GFX11_PCS_SQCMD_SINGLE_WAVE_NO_QUEUE_PROBE = 15,
 };
 
 static int amdkfd_gfx11_pcs_sqcmd_policy =
@@ -51,7 +75,24 @@ module_param_named(amdkfd_gfx11_pcs_sqcmd_policy,
 MODULE_PARM_DESC(amdkfd_gfx11_pcs_sqcmd_policy,
 		 "gfx11 PC sampling SQ_CMD policy: "
 		 "0=single_q0, 1=single_queue_sweep, 2=broadcast, "
-		 "3=single_queue_sweep_no_vmid_check");
+		 "3=single_queue_sweep_no_vmid_check, 4=broadcast_probe, "
+		 "5=broadcast_queue, 6=broadcast_queue_probe, "
+		 "7=single_fixed_q0_w0, 8=single_queue_sweep_w0, 9=noop, "
+		 "10=broadcast_queue_no_vmid, 11=broadcast_queue_no_vmid_probe, "
+		 "12=single_wave_no_queue_no_vmid, 13=broadcast_queue_wave_no_vmid_probe, "
+		 "14=single_wave_no_queue, 15=single_wave_no_queue_probe");
+
+static int amdkfd_gfx11_pcs_max_injected_traps = 512;
+module_param_named(amdkfd_gfx11_pcs_max_injected_traps,
+		   amdkfd_gfx11_pcs_max_injected_traps, int, 0644);
+MODULE_PARM_DESC(amdkfd_gfx11_pcs_max_injected_traps,
+		 "gfx11 PC sampling: maximum SQ_CMD injections per VMID (1..4096)");
+
+static int amdkfd_gfx11_pcs_post_status_delay_us = 100;
+module_param_named(amdkfd_gfx11_pcs_post_status_delay_us,
+		   amdkfd_gfx11_pcs_post_status_delay_us, int, 0644);
+MODULE_PARM_DESC(amdkfd_gfx11_pcs_post_status_delay_us,
+		 "gfx11 PC sampling: delay before post-SQ_CMD hosttrap-status read (0..200000 us)");
 
 static const char *kgd_gfx_v11_pcs_sqcmd_policy_name(int policy)
 {
@@ -64,6 +105,30 @@ static const char *kgd_gfx_v11_pcs_sqcmd_policy_name(int policy)
 		return "broadcast";
 	case AMDKFD_GFX11_PCS_SQCMD_SINGLE_QUEUE_SWEEP_NO_VMID_CHECK:
 		return "single_queue_sweep_no_vmid_check";
+	case AMDKFD_GFX11_PCS_SQCMD_BROADCAST_PROBE:
+		return "broadcast_probe";
+	case AMDKFD_GFX11_PCS_SQCMD_BROADCAST_QUEUE:
+		return "broadcast_queue";
+	case AMDKFD_GFX11_PCS_SQCMD_BROADCAST_QUEUE_PROBE:
+		return "broadcast_queue_probe";
+	case AMDKFD_GFX11_PCS_SQCMD_SINGLE_FIXED_Q0_W0:
+		return "single_fixed_q0_w0";
+	case AMDKFD_GFX11_PCS_SQCMD_SINGLE_QUEUE_SWEEP_W0:
+		return "single_queue_sweep_w0";
+	case AMDKFD_GFX11_PCS_SQCMD_NOOP:
+		return "noop";
+	case AMDKFD_GFX11_PCS_SQCMD_BROADCAST_QUEUE_NO_VMID:
+		return "broadcast_queue_no_vmid";
+	case AMDKFD_GFX11_PCS_SQCMD_BROADCAST_QUEUE_NO_VMID_PROBE:
+		return "broadcast_queue_no_vmid_probe";
+	case AMDKFD_GFX11_PCS_SQCMD_SINGLE_WAVE_NO_QUEUE_NO_VMID:
+		return "single_wave_no_queue_no_vmid";
+	case AMDKFD_GFX11_PCS_SQCMD_BROADCAST_QUEUE_WAVE_NO_VMID_PROBE:
+		return "broadcast_queue_wave_no_vmid_probe";
+	case AMDKFD_GFX11_PCS_SQCMD_SINGLE_WAVE_NO_QUEUE:
+		return "single_wave_no_queue";
+	case AMDKFD_GFX11_PCS_SQCMD_SINGLE_WAVE_NO_QUEUE_PROBE:
+		return "single_wave_no_queue_probe";
 	default:
 		return "invalid";
 	}
@@ -844,10 +909,15 @@ static uint32_t kgd_gfx_v11_hqd_sdma_get_doorbell(struct amdgpu_device *adev,
 }
 
 static uint32_t kgd_gfx_v11_get_hosttrap_status(struct amdgpu_device *adev,
-		uint32_t inst)
+		uint32_t inst, int *se_idx, int *sh_idx)
 {
 	uint32_t sq_debug_hosttrap_status = 0x0;
 	int i, j;
+
+	if (se_idx)
+		*se_idx = -1;
+	if (sh_idx)
+		*sh_idx = -1;
 
 	mutex_lock(&adev->grbm_idx_mutex);
 	for (i = 0; i < adev->gfx.config.max_shader_engines; i++) {
@@ -856,8 +926,13 @@ static uint32_t kgd_gfx_v11_get_hosttrap_status(struct amdgpu_device *adev,
 			sq_debug_hosttrap_status =
 				RREG32_SOC15(GC, GET_INST(GC, inst), regSQ_DEBUG_HOST_TRAP_STATUS);
 
-			if (sq_debug_hosttrap_status)
+			if (sq_debug_hosttrap_status) {
+				if (se_idx)
+					*se_idx = i;
+				if (sh_idx)
+					*sh_idx = j;
 				goto out;
+			}
 		}
 	}
 
@@ -942,9 +1017,10 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 		static uint32_t last_vmid = 0xFFFFFFFF;
 		static uint32_t last_status = 0xFFFFFFFF;
 		static bool cap_logged = false;
-		const uint32_t max_injected_traps = 512;
+		static bool probe_disable = false;
 		int policy = amdkfd_gfx11_pcs_sqcmd_policy;
 		const char *policy_name = kgd_gfx_v11_pcs_sqcmd_policy_name(policy);
+		uint32_t max_injected_traps = amdkfd_gfx11_pcs_max_injected_traps;
 		uint32_t value = 0;
 		uint32_t sq_hosttrap_status = 0x0;
 		uint32_t cmd = SQ_IND_CMD_CMD_TRAP;
@@ -953,10 +1029,22 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 		bool set_wave_id = true;
 		bool set_queue_id = true;
 		bool set_vmid = true;
+		bool issue_sqcmd = true;
+		bool stop_after_nonzero_post_status = false;
 		uint32_t queue_id = 0;
 		uint32_t wave_id = 0;
+		uint32_t post_status_delay_us = amdkfd_gfx11_pcs_post_status_delay_us;
+		int status_se = -1;
+		int status_sh = -1;
 
-		sq_hosttrap_status = kgd_gfx_v11_get_hosttrap_status(adev, inst);
+		if (!max_injected_traps)
+			max_injected_traps = 1;
+		if (max_injected_traps > 4096)
+			max_injected_traps = 4096;
+		if (post_status_delay_us > 200000)
+			post_status_delay_us = 200000;
+
+		sq_hosttrap_status = kgd_gfx_v11_get_hosttrap_status(adev, inst, &status_se, &status_sh);
 		if (vmid != last_vmid) {
 			trigger_count = 0;
 			*target_simd = 0;
@@ -964,6 +1052,7 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 			last_vmid = vmid;
 			last_status = 0xFFFFFFFF;
 			cap_logged = false;
+			probe_disable = false;
 			dev_info(adev->dev,
 				 "trigger_pc_sample_trap: reset state for vmid=%u policy=%s(%d)\n",
 				 vmid, policy_name, policy);
@@ -993,11 +1082,129 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 			wave_id = 0;
 			queue_id = 0;
 			break;
+		case AMDKFD_GFX11_PCS_SQCMD_BROADCAST_PROBE:
+			mode = SQ_IND_CMD_MODE_BROADCAST;
+			check_vmid = 0;
+			set_wave_id = false;
+			set_queue_id = false;
+			set_vmid = false;
+			stop_after_nonzero_post_status = true;
+			if (max_injected_traps > 16)
+				max_injected_traps = 16;
+			wave_id = 0;
+			queue_id = 0;
+			break;
+		case AMDKFD_GFX11_PCS_SQCMD_BROADCAST_QUEUE:
+			mode = SQ_IND_CMD_MODE_BROADCAST_QUEUE;
+			check_vmid = 1;
+			set_wave_id = false;
+			set_queue_id = true;
+			set_vmid = true;
+			wave_id = 0;
+			queue_id = (trigger_count - 1) & 0x7;
+			break;
+		case AMDKFD_GFX11_PCS_SQCMD_BROADCAST_QUEUE_PROBE:
+			mode = SQ_IND_CMD_MODE_BROADCAST_QUEUE;
+			check_vmid = 1;
+			set_wave_id = false;
+			set_queue_id = true;
+			set_vmid = true;
+			stop_after_nonzero_post_status = true;
+			if (max_injected_traps > 16)
+				max_injected_traps = 16;
+			wave_id = 0;
+			queue_id = (trigger_count - 1) & 0x7;
+			break;
 		case AMDKFD_GFX11_PCS_SQCMD_SINGLE_QUEUE_SWEEP_NO_VMID_CHECK:
 			mode = SQ_IND_CMD_MODE_SINGLE;
 			check_vmid = 0;
 			wave_id = ((*target_simd * max_wave_slot) + *target_wave_slot) & 0x1F;
 			queue_id = (trigger_count - 1) & 0x7;
+			break;
+		case AMDKFD_GFX11_PCS_SQCMD_SINGLE_FIXED_Q0_W0:
+			mode = SQ_IND_CMD_MODE_SINGLE;
+			check_vmid = 1;
+			wave_id = 0;
+			queue_id = 0;
+			break;
+		case AMDKFD_GFX11_PCS_SQCMD_SINGLE_QUEUE_SWEEP_W0:
+			mode = SQ_IND_CMD_MODE_SINGLE;
+			check_vmid = 1;
+			wave_id = 0;
+			queue_id = (trigger_count - 1) & 0x7;
+			break;
+		case AMDKFD_GFX11_PCS_SQCMD_NOOP:
+			mode = SQ_IND_CMD_MODE_SINGLE;
+			check_vmid = 0;
+			set_wave_id = false;
+			set_queue_id = false;
+			set_vmid = false;
+			issue_sqcmd = false;
+			wave_id = 0;
+			queue_id = 0;
+			break;
+		case AMDKFD_GFX11_PCS_SQCMD_BROADCAST_QUEUE_NO_VMID:
+			mode = SQ_IND_CMD_MODE_BROADCAST_QUEUE;
+			check_vmid = 0;
+			set_wave_id = false;
+			set_queue_id = true;
+			set_vmid = false;
+			wave_id = 0;
+			queue_id = (trigger_count - 1) & 0x7;
+			break;
+		case AMDKFD_GFX11_PCS_SQCMD_BROADCAST_QUEUE_NO_VMID_PROBE:
+			mode = SQ_IND_CMD_MODE_BROADCAST_QUEUE;
+			check_vmid = 0;
+			set_wave_id = false;
+			set_queue_id = true;
+			set_vmid = false;
+			stop_after_nonzero_post_status = true;
+			if (max_injected_traps > 16)
+				max_injected_traps = 16;
+			wave_id = 0;
+			queue_id = (trigger_count - 1) & 0x7;
+			break;
+		case AMDKFD_GFX11_PCS_SQCMD_SINGLE_WAVE_NO_QUEUE_NO_VMID:
+			mode = SQ_IND_CMD_MODE_SINGLE;
+			check_vmid = 0;
+			set_wave_id = true;
+			set_queue_id = false;
+			set_vmid = false;
+			wave_id = ((*target_simd * max_wave_slot) + *target_wave_slot) & 0x1F;
+			queue_id = 0;
+			break;
+		case AMDKFD_GFX11_PCS_SQCMD_BROADCAST_QUEUE_WAVE_NO_VMID_PROBE:
+			mode = SQ_IND_CMD_MODE_BROADCAST_QUEUE;
+			check_vmid = 0;
+			set_wave_id = true;
+			set_queue_id = true;
+			set_vmid = false;
+			stop_after_nonzero_post_status = true;
+			if (max_injected_traps > 16)
+				max_injected_traps = 16;
+			wave_id = ((*target_simd * max_wave_slot) + *target_wave_slot) & 0x1F;
+			queue_id = (trigger_count - 1) & 0x7;
+			break;
+		case AMDKFD_GFX11_PCS_SQCMD_SINGLE_WAVE_NO_QUEUE:
+			mode = SQ_IND_CMD_MODE_SINGLE;
+			check_vmid = 1;
+			set_wave_id = true;
+			set_queue_id = false;
+			set_vmid = true;
+			wave_id = ((*target_simd * max_wave_slot) + *target_wave_slot) & 0x1F;
+			queue_id = 0;
+			break;
+		case AMDKFD_GFX11_PCS_SQCMD_SINGLE_WAVE_NO_QUEUE_PROBE:
+			mode = SQ_IND_CMD_MODE_SINGLE;
+			check_vmid = 1;
+			set_wave_id = true;
+			set_queue_id = false;
+			set_vmid = true;
+			stop_after_nonzero_post_status = true;
+			if (max_injected_traps > 16)
+				max_injected_traps = 16;
+			wave_id = ((*target_simd * max_wave_slot) + *target_wave_slot) & 0x1F;
+			queue_id = 0;
 			break;
 		default:
 			mode = SQ_IND_CMD_MODE_SINGLE;
@@ -1012,8 +1219,9 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 		log_this_call = (trigger_count <= 20) || (trigger_count % 500 == 0);
 		if (log_this_call || (trigger_count % 1000 == 0))
 			dev_info(adev->dev,
-				 "trigger_pc_sample_trap: count=%d status=0x%x simd=%u wave_slot=%u max_simd=%u max_wave=%u\n",
-				 trigger_count, sq_hosttrap_status, *target_simd, *target_wave_slot,
+				 "trigger_pc_sample_trap: count=%d status=0x%x se=%d sh=%d simd=%u wave_slot=%u max_simd=%u max_wave=%u\n",
+				 trigger_count, sq_hosttrap_status, status_se, status_sh,
+				 *target_simd, *target_wave_slot,
 				 max_simd, max_wave_slot);
 		if (sq_hosttrap_status != last_status) {
 			dev_info(adev->dev,
@@ -1024,11 +1232,20 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 		/* skip when last host trap request is still pending to complete */
 		if (sq_hosttrap_status)
 			return 0;
+		if (!issue_sqcmd) {
+			if (log_this_call || (trigger_count % 1000 == 0))
+				dev_info(adev->dev,
+					 "trigger_pc_sample_trap: NOOP policy active; skipping SQ_CMD write (vmid=%u)\n",
+					 vmid);
+			return 0;
+		}
+		if (probe_disable)
+			return 0;
 		if (trigger_count > max_injected_traps) {
 			if (!cap_logged) {
 				dev_info(adev->dev,
-					 "trigger_pc_sample_trap: injection cap reached at %u for vmid=%u; SQ_CMD disabled for remainder\n",
-					 max_injected_traps, vmid);
+						 "trigger_pc_sample_trap: injection cap reached at %u for vmid=%u; SQ_CMD disabled for remainder\n",
+						 max_injected_traps, vmid);
 				cap_logged = true;
 			}
 			return 0;
@@ -1059,18 +1276,29 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 		mutex_unlock(&adev->grbm_idx_mutex);
 
 		/* Check status after sending command (outside lock) */
-		if (log_this_call) {
+		if (log_this_call || stop_after_nonzero_post_status) {
 			uint32_t post_status;
-			udelay(100);  /* Brief delay for trap to propagate */
-			post_status = kgd_gfx_v11_get_hosttrap_status(adev, inst);
-			dev_info(adev->dev,
-				 "trigger_pc_sample_trap: post_status=0x%x (0=no pending trap)\n",
-				 post_status);
+			int post_status_se = -1;
+			int post_status_sh = -1;
+			if (post_status_delay_us)
+				udelay(post_status_delay_us);  /* Let trap status propagate */
+			post_status = kgd_gfx_v11_get_hosttrap_status(adev, inst,
+								&post_status_se, &post_status_sh);
+			if (log_this_call || post_status)
+				dev_info(adev->dev,
+					 "trigger_pc_sample_trap: post_status=0x%x se=%d sh=%d (0=no pending trap)\n",
+					 post_status, post_status_se, post_status_sh);
 			if (post_status != last_status) {
 				dev_info(adev->dev,
-					 "trigger_pc_sample_trap: post-status transition vmid=%u 0x%x -> 0x%x\n",
-					 vmid, last_status, post_status);
+						 "trigger_pc_sample_trap: post-status transition vmid=%u 0x%x -> 0x%x\n",
+						 vmid, last_status, post_status);
 				last_status = post_status;
+			}
+			if (stop_after_nonzero_post_status && post_status) {
+				probe_disable = true;
+				dev_info(adev->dev,
+					 "trigger_pc_sample_trap: probe latched post_status=0x%x; disabling further SQ_CMD for vmid=%u\n",
+					 post_status, vmid);
 			}
 		}
 
