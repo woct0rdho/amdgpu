@@ -80,8 +80,12 @@ static uint32_t kfd_pc_sampling_lookup_vmid_by_pasid(struct kfd_node *node,
 	uint32_t fallback_first_valid_vmid = 0;
 	uint16_t fallback_first_valid_pasid = 0;
 
-	if (!owner_pasid || !node->kfd2kgd->get_atc_vmid_pasid_mapping_info)
-	{
+	if (!owner_pasid || !node->kfd2kgd->get_atc_vmid_pasid_mapping_info) {
+		if (!owner_pasid)
+			pr_warn_ratelimited("pcs vmid lookup skipped: owner_pasid=0 gc_ip=%06x active_count=%u target_vmid=%u\n",
+				KFD_GC_VERSION(node),
+				READ_ONCE(node->pcs_data.hosttrap_entry.base.active_count),
+				READ_ONCE(node->pcs_data.hosttrap_entry.target_vmid));
 		if (owner_pasid && !node->kfd2kgd->get_atc_vmid_pasid_mapping_info)
 			pr_warn_ratelimited("pcs vmid lookup unavailable: owner_pasid=%u gc_ip=%06x kfd2kgd=%px get_atc=%px trigger=%px (get_atc_vmid_pasid_mapping_info is NULL)\n",
 				owner_pasid, KFD_GC_VERSION(node), node->kfd2kgd,
@@ -203,6 +207,7 @@ static int kfd_pc_sample_thread(void *param)
 	struct amdgpu_device *adev;
 	struct kfd_node *node = param;
 	uint32_t timeout = 0;
+	uint64_t trigger_loop_count = 0;
 	ktime_t next_trap_time;
 	bool need_wait;
 	uint32_t inst;
@@ -222,8 +227,24 @@ static int kfd_pc_sample_thread(void *param)
 		}
 	}
 	mutex_unlock(&node->pcs_data.mutex);
-	if (!timeout)
+	if (!timeout) {
+		pr_warn("pcs hosttrap: thread init disabled active_count=%u interval=%llu trigger=%px method=%u owner_pasid=%u target_vmid=%u\n",
+			READ_ONCE(node->pcs_data.hosttrap_entry.base.active_count),
+			node->pcs_data.hosttrap_entry.base.pc_sample_info.interval,
+			node->kfd2kgd ? node->kfd2kgd->trigger_pc_sample_trap : NULL,
+			node->pcs_data.hosttrap_entry.base.pc_sample_info.method,
+			READ_ONCE(node->pcs_data.hosttrap_entry.owner_pasid),
+			READ_ONCE(node->pcs_data.hosttrap_entry.target_vmid));
 		return -EINVAL;
+	}
+
+	pr_warn("pcs hosttrap: thread init active_count=%u interval_us=%u owner_pasid=%u target_vmid=%u method=%u trigger=%px\n",
+		READ_ONCE(node->pcs_data.hosttrap_entry.base.active_count),
+		timeout,
+		READ_ONCE(node->pcs_data.hosttrap_entry.owner_pasid),
+		READ_ONCE(node->pcs_data.hosttrap_entry.target_vmid),
+		node->pcs_data.hosttrap_entry.base.pc_sample_info.method,
+		node->kfd2kgd ? node->kfd2kgd->trigger_pc_sample_trap : NULL);
 
 	adev = node->adev;
 	need_wait = false;
@@ -258,6 +279,26 @@ static int kfd_pc_sample_thread(void *param)
 				need_wait = true;
 				continue;
 			}
+			if (node->kfd2kgd->program_trap_handler_settings &&
+			    READ_ONCE(node->pcs_data.hosttrap_entry.trap_regs_programmed_vmid) != target_vmid) {
+				uint64_t tba_addr = READ_ONCE(node->pcs_data.hosttrap_entry.trap_tba_addr);
+				uint64_t tma_addr = READ_ONCE(node->pcs_data.hosttrap_entry.trap_tma_addr);
+
+				if (tba_addr || tma_addr) {
+					pr_warn("pcs hosttrap: trigger program trap regs vmid=%u tba=0x%llx tma=0x%llx owner_pasid=%u\n",
+						target_vmid, tba_addr, tma_addr,
+						READ_ONCE(node->pcs_data.hosttrap_entry.owner_pasid));
+					for_each_inst(inst, node->xcc_mask)
+						node->kfd2kgd->program_trap_handler_settings(
+							adev, target_vmid, tba_addr, tma_addr, inst);
+					WRITE_ONCE(node->pcs_data.hosttrap_entry.trap_regs_programmed_vmid,
+						   target_vmid);
+				} else {
+					pr_warn_ratelimited("pcs hosttrap: trigger program trap regs skipped (missing tba/tma) vmid=%u owner_pasid=%u\n",
+						target_vmid,
+						READ_ONCE(node->pcs_data.hosttrap_entry.owner_pasid));
+				}
+			}
 
 			for_each_inst(inst, node->xcc_mask) {
 				int ret;
@@ -273,6 +314,16 @@ static int kfd_pc_sample_thread(void *param)
 						node->pcs_data.hosttrap_entry.base.pc_sample_info.method,
 						node->pcs_data.hosttrap_entry.target_simd,
 						node->pcs_data.hosttrap_entry.target_wave_slot);
+			}
+			trigger_loop_count++;
+			if (trigger_loop_count <= 8 || !(trigger_loop_count % 1000)) {
+				pr_warn("pcs hosttrap: trigger loop=%llu owner_pasid=%u target_vmid=%u active_count=%u simd=%u wave_slot=%u\n",
+					trigger_loop_count,
+					READ_ONCE(node->pcs_data.hosttrap_entry.owner_pasid),
+					target_vmid,
+					READ_ONCE(node->pcs_data.hosttrap_entry.base.active_count),
+					node->pcs_data.hosttrap_entry.target_simd,
+					node->pcs_data.hosttrap_entry.target_wave_slot);
 			}
 			pr_debug_ratelimited("triggered a host trap.");
 			need_wait = true;
@@ -315,8 +366,15 @@ static int kfd_pc_sample_thread_start(struct kfd_node *node)
 	if (IS_ERR(node->pcs_data.hosttrap_entry.pc_sample_thread)) {
 		ret = PTR_ERR(node->pcs_data.hosttrap_entry.pc_sample_thread);
 		node->pcs_data.hosttrap_entry.pc_sample_thread = NULL;
-		pr_debug("Failed to create pc sample thread for %s with ret = %d.",
+		pr_warn("Failed to create pc sample thread for %s with ret = %d.",
 			thread_name, ret);
+	} else {
+		pr_warn("pcs hosttrap: thread started name=%s pid=%d owner_pasid=%u target_vmid=%u interval=%llu\n",
+			thread_name,
+			task_pid_nr(node->pcs_data.hosttrap_entry.pc_sample_thread),
+			READ_ONCE(node->pcs_data.hosttrap_entry.owner_pasid),
+			READ_ONCE(node->pcs_data.hosttrap_entry.target_vmid),
+			node->pcs_data.hosttrap_entry.base.pc_sample_info.interval);
 	}
 
 	return ret;
@@ -423,6 +481,9 @@ static int kfd_pc_sample_start(struct kfd_process_device *pdd,
 
 		pdd->dev->pcs_data.hosttrap_entry.owner_pasid = pdd->pasid;
 		pdd->dev->pcs_data.hosttrap_entry.target_vmid = pdd->qpd.vmid;
+		pdd->dev->pcs_data.hosttrap_entry.trap_tba_addr = pdd->qpd.tba_addr;
+		pdd->dev->pcs_data.hosttrap_entry.trap_tma_addr = pdd->qpd.tma_addr;
+		pdd->dev->pcs_data.hosttrap_entry.trap_regs_programmed_vmid = 0;
 		if (!pdd->dev->pcs_data.hosttrap_entry.target_vmid) {
 			uint32_t resolved_vmid =
 				kfd_pc_sampling_lookup_vmid_by_pasid(
@@ -436,6 +497,12 @@ static int kfd_pc_sample_start(struct kfd_process_device *pdd,
 		}
 
 		target_vmid = pdd->dev->pcs_data.hosttrap_entry.target_vmid;
+		pr_warn("pcs hosttrap: start enter owner_pasid=%u qpd_vmid=%u target_vmid=%u active_before=%u use_count=%u queues_empty=%u process_ref=%u pid=%d tgid=%d\n",
+			pdd->dev->pcs_data.hosttrap_entry.owner_pasid, pdd->qpd.vmid,
+			target_vmid, pdd->dev->pcs_data.hosttrap_entry.base.active_count,
+			pdd->dev->pcs_data.hosttrap_entry.base.use_count,
+			list_empty(&pdd->qpd.queues_list), pdd->process->pc_sampling_ref,
+			current->pid, current->tgid);
 		/* Under MES + no-CWSR, qpd->vmid can stay 0 and VMID is resolved
 		 * dynamically. Program per-VMID trap registers explicitly once VMID
 		 * is known so SQ_CMD host-trap has valid TBA/TMA context.
@@ -452,6 +519,7 @@ static int kfd_pc_sample_start(struct kfd_process_device *pdd,
 				pdd->dev->kfd2kgd->program_trap_handler_settings(
 					pdd->dev->adev, target_vmid, tba_addr, tma_addr,
 					xcc_id);
+			pdd->dev->pcs_data.hosttrap_entry.trap_regs_programmed_vmid = target_vmid;
 		}
 
 		pr_warn("pcs hosttrap: start owner_pasid=%u qpd_vmid=%u active_before=%u use_count=%u pid=%d tgid=%d\n",
@@ -513,8 +581,16 @@ static int kfd_pc_sample_stop(struct kfd_process_device *pdd,
 		pdd->dev->pcs_data.hosttrap_entry.base.active_count--;
 		if (!pdd->dev->pcs_data.hosttrap_entry.base.active_count) {
 			pc_sampling_stop = true;
+			pr_warn("pcs hosttrap: stop clear owner_pasid=%u target_vmid=%u use_count=%u pid=%d tgid=%d\n",
+				pdd->dev->pcs_data.hosttrap_entry.owner_pasid,
+				pdd->dev->pcs_data.hosttrap_entry.target_vmid,
+				pdd->dev->pcs_data.hosttrap_entry.base.use_count,
+				current->pid, current->tgid);
 			pdd->dev->pcs_data.hosttrap_entry.target_vmid = 0;
 			pdd->dev->pcs_data.hosttrap_entry.owner_pasid = 0;
+			pdd->dev->pcs_data.hosttrap_entry.trap_regs_programmed_vmid = 0;
+			pdd->dev->pcs_data.hosttrap_entry.trap_tba_addr = 0;
+			pdd->dev->pcs_data.hosttrap_entry.trap_tma_addr = 0;
 		}
 	} else {/* KFD_IOCTL_PCS_METHOD_STOCHASTIC */
 		pdd->dev->pcs_data.stoch_entry.base.active_count--;

@@ -118,12 +118,26 @@ module_param_named(amdkfd_gfx11_pcs_runtime_reg_readback_on_reset,
 MODULE_PARM_DESC(amdkfd_gfx11_pcs_runtime_reg_readback_on_reset,
 		 "gfx11 PC sampling debug: dump runtime TBA/TMA/GDBG readback at trigger reset (0=off, 1=on)");
 
+static int amdkfd_gfx11_pcs_single_wave_use_status_slot = 0;
+module_param_named(amdkfd_gfx11_pcs_single_wave_use_status_slot,
+		   amdkfd_gfx11_pcs_single_wave_use_status_slot, int, 0644);
+MODULE_PARM_DESC(amdkfd_gfx11_pcs_single_wave_use_status_slot,
+		 "gfx11 PC sampling debug: MODE_SINGLE WAVE_ID source (0=HW_ID1.wave_id, 1=status-slot index)");
+
+static int amdkfd_gfx11_pcs_sqcmd_cmd_override = -1;
+module_param_named(amdkfd_gfx11_pcs_sqcmd_cmd_override,
+		   amdkfd_gfx11_pcs_sqcmd_cmd_override, int, 0644);
+MODULE_PARM_DESC(amdkfd_gfx11_pcs_sqcmd_cmd_override,
+		 "gfx11 PC sampling debug: override SQ_CMD.CMD (-1=default TRAP, 0..15=raw CMD)");
+
 /* Last programmed trap-handler addresses per VMID for trigger-time correlation. */
 static u64 amdkfd_gfx11_last_tba_byte[AMDGPU_NUM_VMID];
 static u64 amdkfd_gfx11_last_tma_byte[AMDGPU_NUM_VMID];
 static u64 amdkfd_gfx11_last_tba_reg[AMDGPU_NUM_VMID];
 static u64 amdkfd_gfx11_last_tma_reg[AMDGPU_NUM_VMID];
 static bool amdkfd_gfx11_last_trap_valid[AMDGPU_NUM_VMID];
+/* Monotonic sequence incremented whenever trap regs are programmed for a VMID. */
+static u64 amdkfd_gfx11_trap_prog_seq[AMDGPU_NUM_VMID];
 
 static const char *kgd_gfx_v11_pcs_sqcmd_policy_name(int policy)
 {
@@ -1022,9 +1036,10 @@ static uint32_t kgd_gfx_v11_wave_read_ind(struct amdgpu_device *adev,
 static void kgd_gfx_v11_dump_wave_trap_state(struct amdgpu_device *adev,
 		uint32_t inst, int se_idx, int sh_idx, uint32_t vmid)
 {
-	uint32_t trapsts, ib_dbg1, status, hw_id1, mode;
+	uint32_t trapsts, ib_dbg1, status, hw_id1, hw_id2, mode;
 	uint32_t pc_lo, pc_hi;
 	uint32_t ttmp0, ttmp1, ttmp14, ttmp15;
+	uint32_t wave_vmid = 0xFFFFFFFF;
 	int wave;
 	int printed = 0;
 
@@ -1032,13 +1047,14 @@ static void kgd_gfx_v11_dump_wave_trap_state(struct amdgpu_device *adev,
 		return;
 
 	mutex_lock(&adev->grbm_idx_mutex);
-	amdgpu_gfx_select_se_sh(adev, se_idx, sh_idx, vmid, inst);
+	amdgpu_gfx_select_se_sh(adev, se_idx, sh_idx, 0xFFFFFFFF, inst);
 
 	for (wave = 0; wave < 32; wave++) {
 		trapsts = kgd_gfx_v11_wave_read_ind(adev, inst, wave, ixSQ_WAVE_TRAPSTS);
 		ib_dbg1 = kgd_gfx_v11_wave_read_ind(adev, inst, wave, ixSQ_WAVE_IB_DBG1);
 		status = kgd_gfx_v11_wave_read_ind(adev, inst, wave, ixSQ_WAVE_STATUS);
 		hw_id1 = kgd_gfx_v11_wave_read_ind(adev, inst, wave, ixSQ_WAVE_HW_ID1);
+		hw_id2 = kgd_gfx_v11_wave_read_ind(adev, inst, wave, ixSQ_WAVE_HW_ID2);
 		mode = kgd_gfx_v11_wave_read_ind(adev, inst, wave, ixSQ_WAVE_MODE);
 		pc_lo = kgd_gfx_v11_wave_read_ind(adev, inst, wave, ixSQ_WAVE_PC_LO);
 		pc_hi = kgd_gfx_v11_wave_read_ind(adev, inst, wave, ixSQ_WAVE_PC_HI);
@@ -1046,9 +1062,16 @@ static void kgd_gfx_v11_dump_wave_trap_state(struct amdgpu_device *adev,
 		ttmp1 = kgd_gfx_v11_wave_read_ind(adev, inst, wave, ixSQ_WAVE_TTMP1);
 		ttmp14 = kgd_gfx_v11_wave_read_ind(adev, inst, wave, ixSQ_WAVE_TTMP14);
 		ttmp15 = kgd_gfx_v11_wave_read_ind(adev, inst, wave, ixSQ_WAVE_TTMP15);
+		if (hw_id2 != 0xbebebeef) {
+			wave_vmid = FIELD_GET(SQ_WAVE_HW_ID2__VM_ID_MASK, hw_id2);
+			if (wave_vmid != vmid)
+				continue;
+		} else {
+			wave_vmid = 0xFFFFFFFF;
+		}
 
 		dev_info(adev->dev,
-			 "trigger_pc_sample_trap: wave_dump vmid=%u se=%d sh=%d wave=%d trapsts=0x%x host_trap=%u status=0x%x(valid=%u trap_en=%u trap=%u idle=%u) mode=0x%x pc_hi=0x%x(ht_bit24=%u trap_id23_16=0x%x ht_bit7=%u trap_id15_8=0x%x) pc_lo=0x%x ttmp1=0x%x(ht=%u trap_id=0x%x) ttmp0=0x%x ttmp14=0x%x ttmp15=0x%x hw_id1=0x%x ib_dbg1=0x%x wave_idle=%u\n",
+			 "trigger_pc_sample_trap: wave_dump vmid=%u se=%d sh=%d wave=%d trapsts=0x%x host_trap=%u status=0x%x(valid=%u trap_en=%u trap=%u idle=%u) mode=0x%x pc_hi=0x%x(ht_bit24=%u trap_id23_16=0x%x ht_bit7=%u trap_id15_8=0x%x) pc_lo=0x%x ttmp1=0x%x(ht=%u trap_id=0x%x) ttmp0=0x%x ttmp14=0x%x ttmp15=0x%x hw_id1=0x%x hw_id2=0x%x(wave_vmid=%u) ib_dbg1=0x%x wave_idle=%u\n",
 			 vmid, se_idx, sh_idx, wave, trapsts,
 			 !!(trapsts & SQ_WAVE_TRAPSTS__HOST_TRAP_MASK),
 			 status,
@@ -1067,13 +1090,14 @@ static void kgd_gfx_v11_dump_wave_trap_state(struct amdgpu_device *adev,
 			 !!(ttmp1 & BIT(24)),
 			 ((ttmp1 >> 16) & 0xff),
 			 ttmp0, ttmp14, ttmp15,
-			 hw_id1, ib_dbg1,
+			 hw_id1, hw_id2, wave_vmid, ib_dbg1,
 			 !!(ib_dbg1 & SQ_WAVE_IB_DBG1__WAVE_IDLE_MASK));
 		if (status == 0xbebebeef &&
 		    hw_id1 == 0xbebebeef &&
+		    hw_id2 == 0xbebebeef &&
 		    ib_dbg1 == 0xbebebeef)
 			dev_info(adev->dev,
-				 "trigger_pc_sample_trap: wave_dump vmid=%u se=%d sh=%d wave=%d has sentinel pattern (SQ_IND_DATA); wave selector may be invalid/stale\n",
+				 "trigger_pc_sample_trap: wave_dump vmid=%u se=%d sh=%d wave=%d has sentinel pattern (SQ_IND_DATA) including HW_ID2; wave selector/context may be invalid/stale\n",
 				 vmid, se_idx, sh_idx, wave);
 		printed++;
 	}
@@ -1173,10 +1197,12 @@ static void kgd_gfx_v11_log_target_vmid_wave_masks(struct amdgpu_device *adev,
 			uint32_t nonzero_status = 0;
 			uint32_t sentinel = 0;
 
-			amdgpu_gfx_select_se_sh(adev, se, sh, vmid, inst);
+			amdgpu_gfx_select_se_sh(adev, se, sh, 0xFFFFFFFF, inst);
 			for (wave = 0; wave < max_waves; wave++) {
 				uint32_t status = kgd_gfx_v11_wave_read_ind(adev, inst, wave,
 									 ixSQ_WAVE_STATUS);
+				uint32_t hw_id2;
+				uint32_t wave_vmid;
 
 				if (status == 0xbebebeef) {
 					sentinel++;
@@ -1191,6 +1217,16 @@ static void kgd_gfx_v11_log_target_vmid_wave_masks(struct amdgpu_device *adev,
 					uint32_t hw_id1;
 					uint32_t hw_wave_id;
 					uint32_t hw_simd_id;
+
+					hw_id2 = kgd_gfx_v11_wave_read_ind(adev, inst, wave,
+									  ixSQ_WAVE_HW_ID2);
+					if (hw_id2 == 0xbebebeef) {
+						sentinel++;
+						continue;
+					}
+					wave_vmid = FIELD_GET(SQ_WAVE_HW_ID2__VM_ID_MASK, hw_id2);
+					if (wave_vmid != vmid)
+						continue;
 
 					valid_mask |= BIT(wave);
 					if (status & SQ_WAVE_STATUS__TRAP_EN_MASK)
@@ -1249,12 +1285,22 @@ static void kgd_gfx_v11_log_selected_wave_visibility(struct amdgpu_device *adev,
 	mutex_lock(&adev->grbm_idx_mutex);
 	for (se = 0; se < adev->gfx.config.max_shader_engines; se++) {
 		for (sh = 0; sh < adev->gfx.config.max_sh_per_se; sh++) {
-			amdgpu_gfx_select_se_sh(adev, se, sh, vmid, inst);
+			amdgpu_gfx_select_se_sh(adev, se, sh, 0xFFFFFFFF, inst);
 			for (wave = 0; wave < max_waves; wave++) {
 				uint32_t status = kgd_gfx_v11_wave_read_ind(adev, inst, wave,
 									 ixSQ_WAVE_STATUS);
+				uint32_t hw_id2;
+				uint32_t wave_vmid;
 
 				if (status == 0xbebebeef || !(status & SQ_WAVE_STATUS__VALID_MASK))
+					continue;
+
+				hw_id2 = kgd_gfx_v11_wave_read_ind(adev, inst, wave,
+								 ixSQ_WAVE_HW_ID2);
+				if (hw_id2 == 0xbebebeef)
+					continue;
+				wave_vmid = FIELD_GET(SQ_WAVE_HW_ID2__VM_ID_MASK, hw_id2);
+				if (wave_vmid != vmid)
 					continue;
 
 				if (wave == expected_wave_id) {
@@ -1400,6 +1446,86 @@ static void kgd_gfx_v11_log_global_wave_vmid_queue_summary(struct amdgpu_device 
 		 sentinel_count, max_waves);
 }
 
+/*
+ * Pick one active trap-enabled wave for target_vmid and return its hardware
+ * queue-id/wave-id. This avoids issuing MODE_SINGLE SQ_CMD to an unrelated
+ * queue, which can latch pending_count without servicing host-trap.
+ */
+static bool kgd_gfx_v11_pick_target_wave_queue(struct amdgpu_device *adev,
+		uint32_t inst, uint32_t target_vmid,
+		uint32_t *wave_id, uint32_t *queue_id, uint32_t *simd_id,
+		uint32_t *status_wave_id, uint32_t *hw_wave_id,
+		uint32_t *se_id, uint32_t *sh_id)
+{
+	int se, sh, wave;
+	int max_waves = amdkfd_gfx11_pcs_wave_scan_max_waves;
+	bool found = false;
+	uint32_t picked_wave = 0, picked_queue = 0, picked_simd = 0;
+	uint32_t picked_status_wave = 0, picked_hw_wave = 0;
+	uint32_t picked_se = 0, picked_sh = 0;
+
+	if (!wave_id || !queue_id || !simd_id || !status_wave_id || !hw_wave_id ||
+	    !se_id || !sh_id)
+		return false;
+
+	if (max_waves < 1)
+		max_waves = 1;
+	if (max_waves > 32)
+		max_waves = 32;
+
+	mutex_lock(&adev->grbm_idx_mutex);
+	for (se = 0; se < adev->gfx.config.max_shader_engines && !found; se++) {
+		for (sh = 0; sh < adev->gfx.config.max_sh_per_se && !found; sh++) {
+			amdgpu_gfx_select_se_sh(adev, se, sh, 0xFFFFFFFF, inst);
+			for (wave = 0; wave < max_waves; wave++) {
+				uint32_t status = kgd_gfx_v11_wave_read_ind(adev, inst, wave,
+									 ixSQ_WAVE_STATUS);
+				uint32_t hw_id1, hw_id2, vmid;
+
+				if (status == 0xbebebeef)
+					continue;
+				if (!(status & SQ_WAVE_STATUS__VALID_MASK))
+					continue;
+				if (!(status & SQ_WAVE_STATUS__TRAP_EN_MASK))
+					continue;
+
+				hw_id1 = kgd_gfx_v11_wave_read_ind(adev, inst, wave, ixSQ_WAVE_HW_ID1);
+				hw_id2 = kgd_gfx_v11_wave_read_ind(adev, inst, wave, ixSQ_WAVE_HW_ID2);
+				if (hw_id1 == 0xbebebeef || hw_id2 == 0xbebebeef)
+					continue;
+
+				vmid = FIELD_GET(SQ_WAVE_HW_ID2__VM_ID_MASK, hw_id2);
+				if (vmid != target_vmid)
+					continue;
+
+				picked_status_wave = wave & 0x1F;
+				picked_hw_wave = FIELD_GET(SQ_WAVE_HW_ID1__WAVE_ID_MASK, hw_id1) & 0x1F;
+				picked_wave = picked_hw_wave;
+				picked_simd = FIELD_GET(SQ_WAVE_HW_ID1__SIMD_ID_MASK, hw_id1) & 0x3;
+				picked_queue = FIELD_GET(SQ_WAVE_HW_ID2__QUEUE_ID_MASK, hw_id2) & 0xF;
+				picked_se = se;
+				picked_sh = sh;
+				found = true;
+				break;
+			}
+		}
+	}
+	amdgpu_gfx_select_se_sh(adev, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, inst);
+	mutex_unlock(&adev->grbm_idx_mutex);
+
+	if (!found)
+		return false;
+
+	*wave_id = picked_wave;
+	*queue_id = picked_queue;
+	*simd_id = picked_simd;
+	*status_wave_id = picked_status_wave;
+	*hw_wave_id = picked_hw_wave;
+	*se_id = picked_se;
+	*sh_id = picked_sh;
+	return true;
+}
+
 static void kgd_gfx_v11_log_runtime_trap_regs(struct amdgpu_device *adev,
 		uint32_t vmid, uint32_t inst)
 {
@@ -1494,6 +1620,7 @@ static void program_trap_handler_settings_v11(struct amdgpu_device *adev,
 		amdkfd_gfx11_last_tba_reg[vmid] = expected_tba_reg;
 		amdkfd_gfx11_last_tma_reg[vmid] = expected_tma_reg;
 		amdkfd_gfx11_last_trap_valid[vmid] = true;
+		amdkfd_gfx11_trap_prog_seq[vmid]++;
 	}
 
 	lock_srbm(adev, 0, 0, 0, vmid);
@@ -1574,8 +1701,21 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 		static uint32_t last_status = 0xFFFFFFFF;
 		static bool cap_logged = false;
 		static bool probe_disable = false;
+		static bool pending_dumped = false;
+		static uint32_t pending_dump_status = 0xFFFFFFFF;
+		static u64 last_prog_seq;
+		static bool last_sqcmd_valid = false;
+		static uint32_t last_sqcmd_value;
+		static uint32_t last_sqcmd_wave_id;
+		static uint32_t last_sqcmd_queue_id;
+		static uint32_t last_sqcmd_mode;
+		static uint32_t last_sqcmd_check_vmid;
+		static bool last_sqcmd_set_wave;
+		static bool last_sqcmd_set_queue;
+		static bool last_sqcmd_set_vmid;
 		int policy = amdkfd_gfx11_pcs_sqcmd_policy;
 		const char *policy_name = kgd_gfx_v11_pcs_sqcmd_policy_name(policy);
+		const char *reset_reason = NULL;
 		uint32_t max_injected_traps = amdkfd_gfx11_pcs_max_injected_traps;
 		uint32_t value = 0;
 		uint32_t sq_hosttrap_status = 0x0;
@@ -1592,8 +1732,13 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 		uint32_t wave_id = 0;
 		uint32_t post_status_delay_us = amdkfd_gfx11_pcs_post_status_delay_us;
 		uint32_t sq_cmd_readback = 0;
+		int cmd_override = amdkfd_gfx11_pcs_sqcmd_cmd_override;
 		int status_se = -1;
 		int status_sh = -1;
+		uint32_t sqcmd_se = 0xFFFFFFFF;
+		uint32_t sqcmd_sh = 0xFFFFFFFF;
+		bool sqcmd_target_se_sh = false;
+		u64 prog_seq = 0;
 
 		if (!max_injected_traps)
 			max_injected_traps = 1;
@@ -1601,10 +1746,20 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 			max_injected_traps = 4096;
 		if (post_status_delay_us > 200000)
 			post_status_delay_us = 200000;
+		if (cmd_override >= 0 && cmd_override <= 0xF)
+			cmd = (uint32_t)cmd_override;
+
+		if (vmid < AMDGPU_NUM_VMID)
+			prog_seq = READ_ONCE(amdkfd_gfx11_trap_prog_seq[vmid]);
 
 		sq_hosttrap_status = kgd_gfx_v11_get_hosttrap_status(adev, inst,
 					     &status_se, &status_sh);
 			if (vmid != last_vmid) {
+				reset_reason = "vmid_changed";
+			} else if (prog_seq != last_prog_seq) {
+				reset_reason = "trap_reprogrammed";
+			}
+			if (reset_reason) {
 				trigger_count = 0;
 				*target_simd = 0;
 				*target_wave_slot = 0;
@@ -1612,9 +1767,13 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 				last_status = 0xFFFFFFFF;
 				cap_logged = false;
 				probe_disable = false;
+				pending_dumped = false;
+				pending_dump_status = 0xFFFFFFFF;
+				last_prog_seq = prog_seq;
+				last_sqcmd_valid = false;
 				dev_info(adev->dev,
-					 "trigger_pc_sample_trap: reset state for vmid=%u policy=%s(%d)\n",
-					 vmid, policy_name, policy);
+					 "trigger_pc_sample_trap: reset state for vmid=%u policy=%s(%d) reason=%s prog_seq=%llu\n",
+					 vmid, policy_name, policy, reset_reason, prog_seq);
 				dev_info(adev->dev,
 					 "trigger_pc_sample_trap: decode constants TRAPSTS_HOST_MASK=0x%x TRAPSTS_HOST_SHIFT=%u STATUS_TRAP_EN_MASK=0x%x STATUS_TRAP_MASK=0x%x\n",
 					 (uint32_t)SQ_WAVE_TRAPSTS__HOST_TRAP_MASK,
@@ -1763,7 +1922,7 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 			mode = SQ_IND_CMD_MODE_SINGLE;
 			check_vmid = 1;
 			set_wave_id = true;
-			set_queue_id = false;
+			set_queue_id = true;
 			set_vmid = true;
 			wave_id = ((*target_simd * max_wave_slot) + *target_wave_slot) & 0x1F;
 			queue_id = 0;
@@ -1772,7 +1931,7 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 			mode = SQ_IND_CMD_MODE_SINGLE;
 			check_vmid = 1;
 			set_wave_id = true;
-			set_queue_id = false;
+			set_queue_id = true;
 			set_vmid = true;
 			stop_after_nonzero_post_status = true;
 			if (max_injected_traps > 16)
@@ -1805,14 +1964,34 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 			}
 			/* skip when last host trap request is still pending to complete */
 			if (sq_pending_count) {
-				if (log_this_call)
+				bool dump_pending_state = (!pending_dumped ||
+							  pending_dump_status != sq_hosttrap_status ||
+							  trigger_count <= 8);
+
+				if (log_this_call || dump_pending_state)
 					dev_info(adev->dev,
 						 "trigger_pc_sample_trap: skip SQ_CMD because pending_count=%u (raw_status=0x%x)\n",
 						 sq_pending_count, sq_hosttrap_status);
-				if (log_this_call)
+				if (dump_pending_state) {
+					dev_info(adev->dev,
+						 "trigger_pc_sample_trap: pending latch vmid=%u trigger_count=%d status=0x%x se=%d sh=%d prog_seq=%llu last_prog_seq=%llu last_vmid=%u\n",
+						 vmid, trigger_count, sq_hosttrap_status, status_se, status_sh,
+						 prog_seq, last_prog_seq, last_vmid);
+					if (last_sqcmd_valid)
+						dev_info(adev->dev,
+							 "trigger_pc_sample_trap: pending latch last_sqcmd=0x%08x mode=%u check_vmid=%u wave_id=%u(set=%u) queue_id=%u(set=%u) vmid_set=%u\n",
+							 last_sqcmd_value, last_sqcmd_mode, last_sqcmd_check_vmid,
+							 last_sqcmd_wave_id, last_sqcmd_set_wave,
+							 last_sqcmd_queue_id, last_sqcmd_set_queue,
+							 last_sqcmd_set_vmid);
 					kgd_gfx_v11_dump_wave_trap_state(adev, inst,
 									 status_se, status_sh,
 								 vmid);
+					if (amdkfd_gfx11_pcs_wave_scan_on_reset)
+						kgd_gfx_v11_log_global_wave_vmid_queue_summary(adev, inst, vmid);
+					pending_dumped = true;
+					pending_dump_status = sq_hosttrap_status;
+				}
 			return 0;
 		}
 		if (!issue_sqcmd) {
@@ -1822,20 +2001,68 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 					 vmid);
 			return 0;
 		}
-		if (probe_disable)
-			return 0;
-		if (trigger_count > max_injected_traps) {
-			if (!cap_logged) {
-				dev_info(adev->dev,
+			if (probe_disable)
+				return 0;
+			if (trigger_count > max_injected_traps) {
+				if (!cap_logged) {
+					dev_info(adev->dev,
 						 "trigger_pc_sample_trap: injection cap reached at %u for vmid=%u; SQ_CMD disabled for remainder\n",
 						 max_injected_traps, vmid);
-				cap_logged = true;
+					cap_logged = true;
+				}
+				return 0;
 			}
-			return 0;
-		}
 
-		value = REG_SET_FIELD(value, SQ_CMD, CMD, cmd);
-		value = REG_SET_FIELD(value, SQ_CMD, MODE, mode);
+			/*
+			 * For MODE_SINGLE hosttrap, steer SQ_CMD to a live queue/wave of
+			 * target VMID. Implicit queue-id=0 on gfx11 can latch pending_count
+			 * when active waves are in a different queue.
+			 */
+			if (mode == SQ_IND_CMD_MODE_SINGLE && check_vmid && set_wave_id) {
+				uint32_t live_wave_id = 0, live_queue_id = 0, live_simd_id = 0;
+				uint32_t live_status_wave = 0, live_hw_wave = 0;
+				uint32_t live_se = 0, live_sh = 0;
+				bool use_status_wave = !!amdkfd_gfx11_pcs_single_wave_use_status_slot;
+				bool live_found =
+					kgd_gfx_v11_pick_target_wave_queue(adev, inst, vmid,
+									 &live_wave_id,
+									 &live_queue_id,
+									 &live_simd_id,
+									 &live_status_wave,
+									 &live_hw_wave,
+									 &live_se,
+									 &live_sh);
+				if (!live_found) {
+					if (log_this_call || (trigger_count % 1000 == 0))
+						dev_info(adev->dev,
+							 "trigger_pc_sample_trap: no live trap-enabled wave for vmid=%u; skip SQ_CMD\n",
+							 vmid);
+					return 0;
+				}
+				sqcmd_target_se_sh = true;
+				sqcmd_se = live_se;
+				sqcmd_sh = live_sh;
+				if (use_status_wave)
+					live_wave_id = live_status_wave;
+
+				if ((wave_id != live_wave_id) || (queue_id != live_queue_id) ||
+				    !set_queue_id) {
+					if (log_this_call || (trigger_count % 1000 == 0))
+						dev_info(adev->dev,
+							 "trigger_pc_sample_trap: retarget single mode vmid=%u wave %u->%u queue %u->%u simd=%u se=%u sh=%u (source=%s status_wave=%u hw_wave=%u)\n",
+							 vmid, wave_id, live_wave_id, queue_id,
+							 live_queue_id, live_simd_id, live_se, live_sh,
+							 use_status_wave ? "status_slot" : "hw_wave",
+							 live_status_wave, live_hw_wave);
+						wave_id = live_wave_id;
+						queue_id = live_queue_id;
+						set_queue_id = true;
+					*target_simd = live_simd_id;
+				}
+			}
+
+			value = REG_SET_FIELD(value, SQ_CMD, CMD, cmd);
+			value = REG_SET_FIELD(value, SQ_CMD, MODE, mode);
 		if (set_wave_id)
 			value = REG_SET_FIELD(value, SQ_CMD, WAVE_ID, wave_id);
 		/* set TrapID 4 for HOSTTRAP */
@@ -1845,24 +2072,39 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 		if (set_vmid)
 			value = REG_SET_FIELD(value, SQ_CMD, VM_ID, vmid);
 		value = REG_SET_FIELD(value, SQ_CMD, CHECK_VMID, check_vmid);
+		last_sqcmd_valid = true;
+		last_sqcmd_value = value;
+		last_sqcmd_wave_id = wave_id;
+		last_sqcmd_queue_id = queue_id;
+		last_sqcmd_mode = mode;
+		last_sqcmd_check_vmid = check_vmid;
+		last_sqcmd_set_wave = set_wave_id;
+		last_sqcmd_set_queue = set_queue_id;
+		last_sqcmd_set_vmid = set_vmid;
 
 			if (log_this_call || (trigger_count % 1000 == 0))
 				dev_info(adev->dev,
-					 "trigger_pc_sample_trap: SQ_CMD=0x%08x vmid=%u cmd=%u mode=%u check_vmid=%u wave_id=%u queue_id=%u simd=%u wave_slot=%u policy=%s\n",
+					 "trigger_pc_sample_trap: SQ_CMD=0x%08x vmid=%u cmd=%u mode=%u check_vmid=%u wave_id=%u queue_id=%u simd=%u wave_slot=%u policy=%s scope=%s scope_se=%u scope_sh=%u\n",
 					 value, vmid, cmd, mode, check_vmid, wave_id, queue_id,
-					 *target_simd, *target_wave_slot, policy_name);
+					 *target_simd, *target_wave_slot, policy_name,
+					 sqcmd_target_se_sh ? "single_se_sh" : "broadcast_all",
+					 sqcmd_se, sqcmd_sh);
 			if (log_this_call)
 				kgd_gfx_v11_log_tma_check(adev, vmid, inst);
 			if (log_this_call && set_wave_id && amdkfd_gfx11_pcs_wave_target_debug)
 				kgd_gfx_v11_log_selected_wave_visibility(adev, inst, vmid,
-								 wave_id,
-								 *target_simd);
+									 wave_id,
+									 *target_simd);
 
 		/* Use direct SQ_CMD write path (same style as gfx12) for host-trap testing. */
 		mutex_lock(&adev->grbm_idx_mutex);
-		amdgpu_gfx_select_se_sh(adev, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, inst);
+		if (sqcmd_target_se_sh)
+			amdgpu_gfx_select_se_sh(adev, sqcmd_se, sqcmd_sh, 0xFFFFFFFF, inst);
+		else
+			amdgpu_gfx_select_se_sh(adev, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, inst);
 		WREG32_SOC15(GC, GET_INST(GC, inst), regSQ_CMD, value);
 		sq_cmd_readback = RREG32_SOC15(GC, GET_INST(GC, inst), regSQ_CMD);
+		amdgpu_gfx_select_se_sh(adev, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, inst);
 		mutex_unlock(&adev->grbm_idx_mutex);
 		if (log_this_call || (trigger_count % 1000 == 0))
 			dev_info(adev->dev,
@@ -1873,6 +2115,7 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 		if (log_this_call || stop_after_nonzero_post_status) {
 			uint32_t post_status;
 			uint32_t post_pending_count;
+			bool post_transition;
 			int post_status_se = -1;
 			int post_status_sh = -1;
 			if (post_status_delay_us)
@@ -1893,7 +2136,17 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 								 vmid);
 			if (post_status && (log_this_call || stop_after_nonzero_post_status))
 				kgd_gfx_v11_log_hosttrap_status_matrix(adev, inst, vmid);
-			if (post_status != last_status) {
+			post_transition = (post_status != last_status);
+			if (post_status && post_transition) {
+				kgd_gfx_v11_log_runtime_trap_regs(adev, vmid, inst);
+				if (amdkfd_gfx11_pcs_wave_scan_on_reset)
+					kgd_gfx_v11_log_global_wave_vmid_queue_summary(adev, inst, vmid);
+				if (set_wave_id && amdkfd_gfx11_pcs_wave_target_debug)
+					kgd_gfx_v11_log_selected_wave_visibility(adev, inst, vmid,
+									 wave_id,
+									 *target_simd);
+			}
+			if (post_transition) {
 				dev_info(adev->dev,
 						 "trigger_pc_sample_trap: post-status transition vmid=%u 0x%x -> 0x%x\n",
 						 vmid, last_status, post_status);

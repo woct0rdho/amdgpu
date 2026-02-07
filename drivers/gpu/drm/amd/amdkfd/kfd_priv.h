@@ -305,6 +305,9 @@ struct kfd_dev_pcs_hosttrap {
 	uint32_t target_simd;       /* target simd for trap */
 	uint32_t target_wave_slot;  /* target wave slot for trap */
 	uint32_t target_vmid;       /* target vmid for host trap */
+	uint32_t trap_regs_programmed_vmid; /* vmid last explicitly trap-programmed */
+	uint64_t trap_tba_addr;     /* cached TBA used for per-VMID trap program */
+	uint64_t trap_tma_addr;     /* cached TMA used for per-VMID trap program */
 	struct task_struct *pc_sample_thread;
 };
 

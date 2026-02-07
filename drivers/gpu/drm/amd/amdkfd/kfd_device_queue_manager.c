@@ -654,6 +654,8 @@ static void deallocate_vmid(struct device_queue_manager *dqm,
 				struct queue *q)
 {
 	struct device *dev = dqm->dev->adev->dev;
+	struct kfd_process_device *pdd = qpd_to_pdd(qpd);
+	uint32_t old_vmid = qpd->vmid;
 
 	/* On GFX v7, CP doesn't flush TC at dequeue */
 	if (q->device->adev->asic_type == CHIP_HAWAII)
@@ -665,6 +667,16 @@ static void deallocate_vmid(struct device_queue_manager *dqm,
 	/* Release the vmid mapping */
 	set_pasid_vmid_mapping(dqm, 0, qpd->vmid);
 	dqm->vmid_pasid[qpd->vmid] = 0;
+
+	if (READ_ONCE(dqm->dev->pcs_data.hosttrap_entry.base.active_count) ||
+	    READ_ONCE(dqm->dev->pcs_data.hosttrap_entry.owner_pasid) == pdd->pasid) {
+		pr_warn("pcs hosttrap: deallocate_vmid pasid=%u old_vmid=%u owner_pasid=%u target_vmid=%u active_count=%u process_ref=%u\n",
+			pdd->pasid, old_vmid,
+			READ_ONCE(dqm->dev->pcs_data.hosttrap_entry.owner_pasid),
+			READ_ONCE(dqm->dev->pcs_data.hosttrap_entry.target_vmid),
+			READ_ONCE(dqm->dev->pcs_data.hosttrap_entry.base.active_count),
+			pdd->process->pc_sampling_ref);
+	}
 
 	qpd->vmid = 0;
 	q->properties.vmid = 0;
