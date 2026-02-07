@@ -94,7 +94,7 @@ module_param_named(amdkfd_gfx11_pcs_post_status_delay_us,
 MODULE_PARM_DESC(amdkfd_gfx11_pcs_post_status_delay_us,
 		 "gfx11 PC sampling: delay before post-SQ_CMD hosttrap-status read (0..200000 us)");
 
-static int amdkfd_gfx11_pcs_wave_scan_on_reset = 1;
+static int amdkfd_gfx11_pcs_wave_scan_on_reset = 0;
 module_param_named(amdkfd_gfx11_pcs_wave_scan_on_reset,
 		   amdkfd_gfx11_pcs_wave_scan_on_reset, int, 0644);
 MODULE_PARM_DESC(amdkfd_gfx11_pcs_wave_scan_on_reset,
@@ -106,7 +106,7 @@ module_param_named(amdkfd_gfx11_pcs_wave_scan_max_waves,
 MODULE_PARM_DESC(amdkfd_gfx11_pcs_wave_scan_max_waves,
 		 "gfx11 PC sampling debug: waves per SH to sample in VMID summary scan (1..32)");
 
-static int amdkfd_gfx11_pcs_wave_target_debug = 1;
+static int amdkfd_gfx11_pcs_wave_target_debug = 0;
 module_param_named(amdkfd_gfx11_pcs_wave_target_debug,
 		   amdkfd_gfx11_pcs_wave_target_debug, int, 0644);
 MODULE_PARM_DESC(amdkfd_gfx11_pcs_wave_target_debug,
@@ -1435,6 +1435,34 @@ static void kgd_gfx_v11_log_runtime_trap_regs(struct amdgpu_device *adev,
 		 expected_tba_reg, expected_tma_reg);
 }
 
+static void kgd_gfx_v11_log_tma_check(struct amdgpu_device *adev,
+		uint32_t vmid, uint32_t inst)
+{
+	uint32_t tma_lo, tma_hi;
+	u64 programmed_tma_reg, programmed_tma_byte;
+	bool have_expected = false;
+	u64 expected_tma_byte = 0, expected_tma_reg = 0;
+
+	if (vmid < AMDGPU_NUM_VMID && amdkfd_gfx11_last_trap_valid[vmid]) {
+		have_expected = true;
+		expected_tma_byte = amdkfd_gfx11_last_tma_byte[vmid];
+		expected_tma_reg = amdkfd_gfx11_last_tma_reg[vmid];
+	}
+
+	lock_srbm(adev, 0, 0, 0, vmid);
+	tma_lo = RREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TMA_LO);
+	tma_hi = RREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TMA_HI);
+	unlock_srbm(adev);
+
+	programmed_tma_reg = ((u64)tma_hi << 32) | tma_lo;
+	programmed_tma_byte = programmed_tma_reg << 8;
+
+	dev_info(adev->dev,
+		 "trigger_pc_sample_trap: tma_check vmid=%u expected_valid=%u intended_tma_byte=0x%llx intended_tma_reg=0x%llx programmed_tma_reg=0x%llx programmed_tma_byte=0x%llx\n",
+		 vmid, have_expected, expected_tma_byte, expected_tma_reg,
+		 programmed_tma_reg, programmed_tma_byte);
+}
+
 static void program_trap_handler_settings_v11(struct amdgpu_device *adev,
 		uint32_t vmid, uint64_t tba_addr, uint64_t tma_addr,
 		uint32_t inst)
@@ -1534,7 +1562,6 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 		static uint32_t last_status = 0xFFFFFFFF;
 		static bool cap_logged = false;
 		static bool probe_disable = false;
-		static bool mid_run_wave_scan_logged = false;
 		int policy = amdkfd_gfx11_pcs_sqcmd_policy;
 		const char *policy_name = kgd_gfx_v11_pcs_sqcmd_policy_name(policy);
 		uint32_t max_injected_traps = amdkfd_gfx11_pcs_max_injected_traps;
@@ -1573,7 +1600,6 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 				last_status = 0xFFFFFFFF;
 				cap_logged = false;
 				probe_disable = false;
-				mid_run_wave_scan_logged = false;
 				dev_info(adev->dev,
 					 "trigger_pc_sample_trap: reset state for vmid=%u policy=%s(%d)\n",
 					 vmid, policy_name, policy);
@@ -1759,11 +1785,6 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 					 trigger_count, sq_hosttrap_status, sq_pending_count, status_se, status_sh,
 					 *target_simd, *target_wave_slot,
 					 max_simd, max_wave_slot);
-			if (!mid_run_wave_scan_logged && trigger_count == 10 &&
-			    amdkfd_gfx11_pcs_wave_scan_on_reset) {
-				kgd_gfx_v11_log_global_wave_vmid_queue_summary(adev, inst, vmid);
-				mid_run_wave_scan_logged = true;
-			}
 			if (sq_hosttrap_status != last_status) {
 				dev_info(adev->dev,
 					 "trigger_pc_sample_trap: status transition vmid=%u 0x%x -> 0x%x\n",
@@ -1818,6 +1839,8 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 					 "trigger_pc_sample_trap: SQ_CMD=0x%08x vmid=%u cmd=%u mode=%u check_vmid=%u wave_id=%u queue_id=%u simd=%u wave_slot=%u policy=%s\n",
 					 value, vmid, cmd, mode, check_vmid, wave_id, queue_id,
 					 *target_simd, *target_wave_slot, policy_name);
+			if (log_this_call)
+				kgd_gfx_v11_log_tma_check(adev, vmid, inst);
 			if (log_this_call && set_wave_id && amdkfd_gfx11_pcs_wave_target_debug)
 				kgd_gfx_v11_log_selected_wave_visibility(adev, inst, vmid,
 								 wave_id,
