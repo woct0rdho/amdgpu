@@ -301,6 +301,7 @@ struct kfd_dev_pc_sampling_data {
 
 struct kfd_dev_pcs_hosttrap {
 	struct kfd_dev_pc_sampling_data base;
+	uint32_t owner_pasid;       /* session owner PASID for host trap */
 	uint32_t target_simd;       /* target simd for trap */
 	uint32_t target_wave_slot;  /* target wave slot for trap */
 	uint32_t target_vmid;       /* target vmid for host trap */

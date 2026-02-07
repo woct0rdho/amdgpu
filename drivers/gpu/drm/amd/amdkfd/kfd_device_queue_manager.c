@@ -281,6 +281,10 @@ static int add_queue_mes(struct device_queue_manager *dqm, struct queue *q,
 
 	queue_input.exclusively_scheduled = q->properties.is_gws;
 
+	pr_warn("pcs mes add_queue: pasid=%u qpd_vmid=%u queue_type=%u active=%u tba=0x%llx tma=0x%llx doorbell=0x%x\n",
+		pdd->pasid, qpd->vmid, q->properties.type, q->properties.is_active,
+		qpd->tba_addr, qpd->tma_addr, q->properties.doorbell_off);
+
 	amdgpu_mes_lock(&adev->mes);
 	r = adev->mes.funcs->add_hw_queue(&adev->mes, &queue_input);
 	amdgpu_mes_unlock(&adev->mes);
@@ -559,6 +563,9 @@ static int allocate_vmid(struct device_queue_manager *dqm,
 {
 	struct kfd_process_device *pdd = qpd_to_pdd(qpd);
 	struct device *dev = dqm->dev->adev->dev;
+	uint32_t pcs_active_count;
+	uint32_t pcs_owner_pasid;
+	uint32_t pcs_target_vmid;
 	int allocated_vmid = -1, i;
 
 	for (i = dqm->dev->vm_info.first_vmid_kfd;
@@ -582,6 +589,26 @@ static int allocate_vmid(struct device_queue_manager *dqm,
 
 	qpd->vmid = allocated_vmid;
 	q->properties.vmid = allocated_vmid;
+
+	pcs_active_count = READ_ONCE(dqm->dev->pcs_data.hosttrap_entry.base.active_count);
+	pcs_owner_pasid = READ_ONCE(dqm->dev->pcs_data.hosttrap_entry.owner_pasid);
+	pcs_target_vmid = READ_ONCE(dqm->dev->pcs_data.hosttrap_entry.target_vmid);
+
+	/* Host-trap PC sampling may start before queue VMID is assigned.
+	 * Refresh target_vmid only for the owning PASID if target_vmid is not set.
+	 */
+	if (pcs_active_count && pcs_owner_pasid == pdd->pasid && !pcs_target_vmid) {
+		WRITE_ONCE(dqm->dev->pcs_data.hosttrap_entry.target_vmid, allocated_vmid);
+		pr_warn("pcs hosttrap: allocate_vmid set target_vmid=%u owner_pasid=%u process_ref=%u\n",
+			allocated_vmid, pcs_owner_pasid, pdd->process->pc_sampling_ref);
+	} else if (pcs_active_count && pcs_owner_pasid == pdd->pasid) {
+		pr_warn("pcs hosttrap: allocate_vmid owner_pasid=%u already has target_vmid=%u (new_vmid=%u, process_ref=%u)\n",
+			pcs_owner_pasid, pcs_target_vmid, allocated_vmid, pdd->process->pc_sampling_ref);
+	} else if (pcs_active_count || pdd->process->pc_sampling_ref) {
+		pr_warn("pcs hosttrap: allocate_vmid observed non-owner allocation pasid=%u new_vmid=%u owner_pasid=%u target_vmid=%u active_count=%u process_ref=%u\n",
+			pdd->pasid, allocated_vmid, pcs_owner_pasid, pcs_target_vmid,
+			pcs_active_count, pdd->process->pc_sampling_ref);
+	}
 
 	program_sh_mem_settings(dqm, qpd);
 
@@ -1534,7 +1561,7 @@ set_pasid_vmid_mapping(struct device_queue_manager *dqm, u32 pasid,
 			unsigned int vmid)
 {
 	uint32_t xcc_mask = dqm->dev->xcc_mask;
-	int xcc_id, ret;
+	int xcc_id, ret = 0;
 
 	for_each_inst(xcc_id, xcc_mask) {
 		ret = dqm->dev->kfd2kgd->set_pasid_vmid_mapping(
@@ -1542,6 +1569,9 @@ set_pasid_vmid_mapping(struct device_queue_manager *dqm, u32 pasid,
 		if (ret)
 			break;
 	}
+
+	pr_warn("pcs vmid map op: pasid=%u vmid=%u ret=%d xcc_mask=0x%x\n",
+		pasid, vmid, ret, xcc_mask);
 
 	return ret;
 }

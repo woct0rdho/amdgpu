@@ -235,6 +235,18 @@ static int set_pasid_vmid_mapping_v11(struct amdgpu_device *adev, unsigned int p
 	return 0;
 }
 
+static bool get_atc_vmid_pasid_mapping_info_v11(struct amdgpu_device *adev,
+					uint8_t vmid, uint16_t *p_pasid)
+{
+	if (!p_pasid)
+		return false;
+
+	*p_pasid = RREG32(SOC15_REG_OFFSET(OSSSYS, 0, regIH_VMID_0_LUT) + vmid) &
+		   0xffff;
+
+	return !!(*p_pasid);
+}
+
 static int init_interrupts_v11(struct amdgpu_device *adev, uint32_t pipe_id,
 				uint32_t inst)
 {
@@ -1930,7 +1942,7 @@ const struct kfd2kgd_calls gfx_v11_kfd2kgd = {
 	.hqd_destroy = hqd_destroy_v11,
 	.hqd_sdma_destroy = hqd_sdma_destroy_v11,
 	.wave_control_execute = wave_control_execute_v11,
-	.get_atc_vmid_pasid_mapping_info = NULL,
+	.get_atc_vmid_pasid_mapping_info = get_atc_vmid_pasid_mapping_info_v11,
 	.set_vm_context_page_table_base = set_vm_context_page_table_base_v11,
 	.enable_debug_trap = kgd_gfx_v11_enable_debug_trap,
 	.disable_debug_trap = kgd_gfx_v11_disable_debug_trap,
