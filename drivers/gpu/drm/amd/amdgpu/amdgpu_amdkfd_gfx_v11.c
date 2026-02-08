@@ -1266,46 +1266,45 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 				 "trigger_pc_sample_trap: SQ_CMD=0x%08x vmid=%u mode=%u wave_id=%u\n",
 				 value, vmid, mode, wave_id);
 
-		/*
-		 * MES overwrites SQ_SHADER_TBA/TMA registers after SRBM programming.
-		 * Re-program them before every SQ_CMD to ensure the trap handler has
-		 * valid TBA/TMA context when the host trap fires.
-		 */
-		if (vmid < AMDGPU_NUM_VMID && amdkfd_gfx11_last_trap_valid[vmid]) {
-			u64 tba = amdkfd_gfx11_last_tba_byte[vmid];
-			u64 tma = amdkfd_gfx11_last_tma_byte[vmid];
-
-			lock_srbm(adev, 0, 0, 0, vmid);
-			WREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TBA_LO,
-				     lower_32_bits(tba >> 8));
-			WREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TBA_HI,
-				     upper_32_bits(tba >> 8) |
-				     (1 << SQ_SHADER_TBA_HI__TRAP_EN__SHIFT));
-			WREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TMA_LO,
-				     lower_32_bits(tma >> 8));
-			WREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TMA_HI,
-				     upper_32_bits(tma >> 8));
-			WREG32_SOC15(GC, GET_INST(GC, inst), regSPI_GDBG_PER_VMID_CNTL,
-				     REG_SET_FIELD(0, SPI_GDBG_PER_VMID_CNTL, TRAP_EN, 1));
-			unlock_srbm(adev);
-		}
-
 		/* Write SQ_CMD with broadcast SE/SH (same as gfx12) */
 		mutex_lock(&adev->grbm_idx_mutex);
 		amdgpu_gfx_select_se_sh(adev, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, inst);
 		WREG32_SOC15(GC, GET_INST(GC, inst), regSQ_CMD, value);
 		amdgpu_gfx_select_se_sh(adev, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, inst);
+
 		mutex_unlock(&adev->grbm_idx_mutex);
 
-		/* Optional post-status check for debugging */
-		if (log_this_call && post_status_delay_us) {
+		/* Post-status check: always run to detect first successful trap */
+		if (post_status_delay_us) {
+			static bool ever_trapped = false;
 			uint32_t post_status;
 			int post_se = -1, post_sh = -1;
 
 			udelay(post_status_delay_us);
 			post_status = kgd_gfx_v11_get_hosttrap_status(adev, inst,
 								      &post_se, &post_sh);
-			if (post_status)
+			if (post_status && !ever_trapped) {
+				uint32_t tma_lo, tma_hi, tba_lo, tba_hi, gdbg;
+
+				ever_trapped = true;
+				/* Read TMA/TBA registers to see what trap handler would get */
+				lock_srbm(adev, 0, 0, 0, vmid);
+				tba_lo = RREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TBA_LO);
+				tba_hi = RREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TBA_HI);
+				tma_lo = RREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TMA_LO);
+				tma_hi = RREG32_SOC15(GC, GET_INST(GC, inst), regSQ_SHADER_TMA_HI);
+				gdbg = RREG32_SOC15(GC, GET_INST(GC, inst), regSPI_GDBG_PER_VMID_CNTL);
+				unlock_srbm(adev);
+				dev_info(adev->dev,
+					 "trigger_pc_sample_trap: FIRST post_status=0x%x se=%d sh=%d at count=%d\n",
+					 post_status, post_se, post_sh, trigger_count);
+				dev_info(adev->dev,
+					 "trigger_pc_sample_trap: FIRST regs vmid=%u TBA=0x%x_%x TMA=0x%x_%x GDBG=0x%x\n",
+					 vmid, tba_hi, tba_lo, tma_hi, tma_lo, gdbg);
+				/* Dump wave state to see trapped waves */
+				kgd_gfx_v11_dump_wave_trap_state(adev, inst, post_se, post_sh, vmid);
+			}
+			if (post_status && log_this_call)
 				dev_info(adev->dev,
 					 "trigger_pc_sample_trap: post_status=0x%x se=%d sh=%d\n",
 					 post_status, post_se, post_sh);

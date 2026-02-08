@@ -3723,9 +3723,28 @@ void remap_queue(struct device_queue_manager *dqm,
 				enum kfd_unmap_queues_filter filter,
 				uint32_t filter_param)
 {
+	int ret;
+
 	dqm_lock(dqm);
-	if (!dqm->dev->kfd->shared_resources.enable_mes)
+	if (!dqm->dev->kfd->shared_resources.enable_mes) {
 		execute_queues_cpsch(dqm, filter, filter_param, USE_DEFAULT_GRACE_PERIOD);
+	} else {
+		/*
+		 * For MES: remove all queues and re-add them so MES picks up
+		 * updated qpd fields (e.g. tba_addr/tma_addr after
+		 * SetTrapHandler).  MES caches these from add_queue_mes and
+		 * programs them into per-VMID registers on every remap.
+		 */
+		ret = remove_all_kfd_queues_mes(dqm);
+		if (ret) {
+			pr_warn("remap_queue: remove_all_kfd_queues_mes failed %d\n", ret);
+			goto out;
+		}
+		ret = add_all_kfd_queues_mes(dqm);
+		if (ret)
+			pr_warn("remap_queue: add_all_kfd_queues_mes failed %d\n", ret);
+	}
+out:
 	dqm_unlock(dqm);
 }
 

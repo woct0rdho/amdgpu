@@ -541,6 +541,30 @@ static int kfd_pc_sample_start(struct kfd_process_device *pdd,
 	}
 	mutex_unlock(&pdd->dev->pcs_data.mutex);
 
+	/*
+	 * Remap queues so MES picks up the current qpd->tba_addr/tma_addr.
+	 * Queues created before SetTrapHandler (UpdateTrapHandlerWithPCS)
+	 * have stale TBA/TMA=0 in MES; the remap forces remove+add which
+	 * re-reads the updated values.
+	 */
+	if (pc_sampling_start && pcs_entry->method == KFD_IOCTL_PCS_METHOD_HOSTTRAP) {
+		/*
+		 * Tell MES to persistently set SPI_GDBG_PER_VMID_CNTL.TRAP_EN=1
+		 * for this process. Without this, MES may overwrite the SRBM-
+		 * programmed TRAP_EN on queue remap, preventing SQ_CMD TRAP
+		 * from delivering traps.
+		 */
+		ret = kfd_dbg_set_mes_debug_mode(pdd, true);
+		if (ret)
+			pr_warn("pcs hosttrap: set_mes_debug_mode failed %d\n", ret);
+		else
+			pr_warn("pcs hosttrap: set_mes_debug_mode OK (TRAP_EN=1 via MES)\n");
+
+		pr_warn("pcs hosttrap: remapping queues to update MES TBA/TMA\n");
+		remap_queue(pdd->dev->dqm,
+			KFD_UNMAP_QUEUES_FILTER_ALL_QUEUES, 0);
+	}
+
 	while (pc_sampling_start) {
 		if (pcs_entry->method == KFD_IOCTL_PCS_METHOD_HOSTTRAP) {
 			/* true means pc_sample_thread stop is in progress */
