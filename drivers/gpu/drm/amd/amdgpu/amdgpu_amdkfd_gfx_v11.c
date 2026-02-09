@@ -43,7 +43,7 @@ enum amdkfd_gfx11_pcs_sqcmd_policy {
 };
 
 static int amdkfd_gfx11_pcs_sqcmd_policy =
-	AMDKFD_GFX11_PCS_SQCMD_DEFAULT;
+	AMDKFD_GFX11_PCS_SQCMD_BROADCAST;
 module_param_named(amdkfd_gfx11_pcs_sqcmd_policy,
 		   amdkfd_gfx11_pcs_sqcmd_policy, int, 0644);
 MODULE_PARM_DESC(amdkfd_gfx11_pcs_sqcmd_policy,
@@ -62,6 +62,12 @@ static u64 amdkfd_gfx11_last_tma_reg[AMDGPU_NUM_VMID];
 static bool amdkfd_gfx11_last_trap_valid[AMDGPU_NUM_VMID];
 /* Monotonic sequence incremented whenever trap regs are programmed for a VMID. */
 static u64 amdkfd_gfx11_trap_prog_seq[AMDGPU_NUM_VMID];
+/* Number of trapped waves found by the last read_trapped_pcs call.
+ * Used by trigger_pc_sample_trap to skip SQ_CMD when waves are
+ * still trapped — issuing BROADCAST SQ_CMD while waves are in
+ * PRIV=1 causes permanent re-trap loops.
+ */
+static int amdkfd_gfx11_last_trapped_count;
 
 static const char *kgd_gfx_v11_pcs_sqcmd_policy_name(int policy)
 {
@@ -931,6 +937,22 @@ static uint32_t kgd_gfx_v11_wave_read_ind(struct amdgpu_device *adev,
 	return RREG32_SOC15(GC, GET_INST(GC, inst), regSQ_IND_DATA);
 }
 
+/* Read a pair of consecutive SQ_IND registers using AUTO_INCR.
+ * Single index setup + two data reads may be more reliable than
+ * two separate index+data transactions for TTMP registers.
+ */
+static void kgd_gfx_v11_wave_read_ind_pair(struct amdgpu_device *adev,
+		uint32_t inst, uint32_t wave, uint32_t address,
+		uint32_t *lo, uint32_t *hi)
+{
+	WREG32_SOC15(GC, GET_INST(GC, inst), regSQ_IND_INDEX,
+		(wave << SQ_IND_INDEX__WAVE_ID__SHIFT) |
+		(address << SQ_IND_INDEX__INDEX__SHIFT) |
+		(SQ_IND_INDEX__AUTO_INCR_MASK));
+	*lo = RREG32_SOC15(GC, GET_INST(GC, inst), regSQ_IND_DATA);
+	*hi = RREG32_SOC15(GC, GET_INST(GC, inst), regSQ_IND_DATA);
+}
+
 static void kgd_gfx_v11_dump_wave_trap_state(struct amdgpu_device *adev,
 		uint32_t inst, int se_idx, int sh_idx, uint32_t vmid)
 {
@@ -1162,8 +1184,9 @@ static void program_trap_handler_settings_v11(struct amdgpu_device *adev,
 /*
  * Read PC samples directly from trapped waves via SQ_IND register interface.
  * GFX11.5 workaround: the trap handler cannot do VMEM in trap context, so
- * the kernel reads the original PC from TTMP0/TTMP1 while the trap handler
- * holds the wave with s_sleep.
+ * the kernel reads wave state while the trap handler holds waves with s_sleep.
+ * Prefers TTMP8/TTMP9 (where trap handler saved the original PC) over
+ * TTMP0/TTMP1 (which may be overwritten by re-traps on already-trapped waves).
  *
  * Returns number of samples collected.
  */
@@ -1174,8 +1197,21 @@ static int kgd_gfx_v11_read_trapped_pcs(struct amdgpu_device *adev,
 	int num_se = adev->gfx.config.max_shader_engines;
 	int num_sh = adev->gfx.config.max_sh_per_se;
 	int samples = 0;
+	int valid_count = 0, trapped_count = 0, vmid_match = 0;
+	int corrupt_count = 0;
 	static int total_samples;
+	static int call_count;
 
+	/* Abort if GPU reset is in progress — register reads are
+	 * unreliable and may interfere with the reset sequence.
+	 */
+	if (amdgpu_in_reset(adev)) {
+		dev_info_ratelimited(adev->dev,
+			"read_pcs: skipping — GPU reset in progress\n");
+		return 0;
+	}
+
+	call_count++;
 	mutex_lock(&adev->grbm_idx_mutex);
 
 	for (se = 0; se < num_se; se++) {
@@ -1190,12 +1226,21 @@ static int kgd_gfx_v11_read_trapped_pcs(struct amdgpu_device *adev,
 
 				status = kgd_gfx_v11_wave_read_ind(
 					adev, inst, wave, ixSQ_WAVE_STATUS);
+
+				/* Sanity-check STATUS: bits 24-31 are
+				 * reserved and must be zero.  Non-zero
+				 * upper byte means read corruption
+				 * (observed on calls 2+ in dmesg).
+				 */
+				if (status & 0xFF000000) {
+					corrupt_count++;
+					continue;
+				}
+
 				/* Skip empty/invalid wave slots */
 				if (!(status & SQ_WAVE_STATUS__VALID_MASK))
 					continue;
-				/* Only interested in trapped waves */
-				if (!(status & SQ_WAVE_STATUS__TRAP_MASK))
-					continue;
+				valid_count++;
 
 				hw_id2 = kgd_gfx_v11_wave_read_ind(
 					adev, inst, wave, ixSQ_WAVE_HW_ID2);
@@ -1203,14 +1248,62 @@ static int kgd_gfx_v11_read_trapped_pcs(struct amdgpu_device *adev,
 					continue;
 				wave_vmid = FIELD_GET(
 					SQ_WAVE_HW_ID2__VM_ID_MASK, hw_id2);
-				if (wave_vmid != vmid)
+
+				/* Check PRIV bit: wave is in trap handler
+				 * (STATUS.PRIV=1 means privileged/trap-handler
+				 * mode; STATUS.TRAP=pending, not active).
+				 * Reading registers from non-PRIV waves is
+				 * unsafe and can hang the GPU.
+				 */
+				if (status & SQ_WAVE_STATUS__PRIV_MASK)
+					trapped_count++;
+
+				/* Log first few valid waves */
+				if (call_count <= 3 && valid_count <= 8)
+					dev_info(adev->dev,
+						 "read_pcs: call=%d se=%d sh=%d wave=%d status=0x%x priv=%d hw_id2=0x%x vmid=%u (want %u)\n",
+						 call_count, se, sh, wave,
+						 status,
+						 !!(status & SQ_WAVE_STATUS__PRIV_MASK),
+						 hw_id2, wave_vmid, vmid);
+
+				/* Only read registers from waves in trap
+				 * handler (PRIV=1) with matching VMID.
+				 */
+				if (!(status & SQ_WAVE_STATUS__PRIV_MASK))
 					continue;
 
-				/* Read original PC saved by HW at trap entry */
-				ttmp0 = kgd_gfx_v11_wave_read_ind(
-					adev, inst, wave, ixSQ_WAVE_TTMP0);
-				ttmp1 = kgd_gfx_v11_wave_read_ind(
-					adev, inst, wave, ixSQ_WAVE_TTMP1);
+				if (wave_vmid != vmid)
+					continue;
+				vmid_match++;
+
+				/* Read TTMP0/1 using AUTO_INCR pair read,
+				 * then retry up to 3 times if both are zero.
+				 * GFX11 SQ_IND has no FORCE_READ — TTMP reads
+				 * are intermittently zero (~80%) for sleeping
+				 * waves.  Retries + pair reads improve yield.
+				 */
+				{
+				u32 pc_lo, pc_hi;
+				u64 cur_pc;
+				int retry;
+
+				ttmp0 = 0;
+				ttmp1 = 0;
+				for (retry = 0; retry < 3; retry++) {
+					kgd_gfx_v11_wave_read_ind_pair(
+						adev, inst, wave,
+						ixSQ_WAVE_TTMP0,
+						&ttmp0, &ttmp1);
+					if (ttmp0 || ttmp1)
+						break;
+				}
+
+				pc_lo = kgd_gfx_v11_wave_read_ind(
+					adev, inst, wave, ixSQ_WAVE_PC_LO);
+				pc_hi = kgd_gfx_v11_wave_read_ind(
+					adev, inst, wave, ixSQ_WAVE_PC_HI);
+				cur_pc = ((u64)pc_hi << 32) | pc_lo;
 
 				/* PC = ttmp1[15:0]:ttmp0[31:0] */
 				orig_pc = ((u64)(ttmp1 & 0xFFFF) << 32) |
@@ -1219,12 +1312,14 @@ static int kgd_gfx_v11_read_trapped_pcs(struct amdgpu_device *adev,
 				samples++;
 				total_samples++;
 				if (total_samples <= 20 ||
-				    total_samples % 100 == 0)
+				    total_samples % 10000 == 0)
 					dev_info(adev->dev,
-						 "pcs_sample: #%d se=%d sh=%d wave=%d vmid=%u pc=0x%llx ttmp0=0x%x ttmp1=0x%x\n",
+						 "pcs_sample: #%d se=%d sh=%d wave=%d vmid=%u pc=0x%llx ttmp01=0x%x_%x curpc=0x%llx retry=%d\n",
 						 total_samples, se, sh, wave,
 						 wave_vmid, orig_pc,
-						 ttmp0, ttmp1);
+						 ttmp1, ttmp0,
+						 cur_pc, retry);
+				}
 			}
 		}
 	}
@@ -1232,6 +1327,13 @@ static int kgd_gfx_v11_read_trapped_pcs(struct amdgpu_device *adev,
 	amdgpu_gfx_select_se_sh(adev, 0xFFFFFFFF, 0xFFFFFFFF,
 				0xFFFFFFFF, inst);
 	mutex_unlock(&adev->grbm_idx_mutex);
+
+	amdkfd_gfx11_last_trapped_count = trapped_count;
+
+	if (call_count <= 10 || (samples > 0 && (total_samples <= 50 || total_samples % 1000 == 0)))
+		dev_info(adev->dev,
+			 "read_pcs: call=%d valid=%d trapped=%d vmid_match=%d samples=%d total=%d corrupt=%d\n",
+			 call_count, valid_count, trapped_count, vmid_match, samples, total_samples, corrupt_count);
 
 	return samples;
 }
@@ -1247,6 +1349,10 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 	uint32_t max_wave_slot = adev->gfx.cu_info.max_waves_per_simd;
 	bool log_this_call = false;
 
+	/* Abort if GPU reset is in progress */
+	if (amdgpu_in_reset(adev))
+		return 0;
+
 	if (!max_wave_slot)
 		max_wave_slot = 16;
 	if (max_wave_slot > 16)
@@ -1261,9 +1367,9 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 		uint32_t value = 0;
 		uint32_t sq_hosttrap_status;
 		uint32_t sq_pending_count;
-		uint32_t mode = SQ_IND_CMD_MODE_SINGLE;
-		uint32_t check_vmid = 0;
-		bool set_wave_id = true;
+		uint32_t mode = SQ_IND_CMD_MODE_BROADCAST;
+		uint32_t check_vmid = 1;
+		bool set_wave_id = false;
 		bool issue_sqcmd = true;
 		uint32_t wave_id = 0;
 		uint32_t post_status_delay_us = amdkfd_gfx11_pcs_post_status_delay_us;
@@ -1286,10 +1392,26 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 			last_vmid = vmid;
 			last_status = 0xFFFFFFFF;
 			last_prog_seq = prog_seq;
+			amdkfd_gfx11_last_trapped_count = 0;
 			dev_info(adev->dev,
 				 "trigger_pc_sample_trap: reset vmid=%u policy=%s prog_seq=%llu\n",
 				 vmid, policy_name, prog_seq);
 			kgd_gfx_v11_log_runtime_trap_regs(adev, vmid, inst);
+		}
+
+		/* Check if waves are still trapped from the previous
+		 * SQ_CMD.  If so, read their PCs but do NOT issue a
+		 * new SQ_CMD — that would set STATUS.TRAP (held pending)
+		 * on waves already in PRIV=1, causing them to re-trap
+		 * immediately on s_rfe_b64 and get permanently stuck.
+		 */
+		if (amdkfd_gfx11_last_trapped_count > 0) {
+			if (log_this_call || trigger_count <= 20)
+				dev_info(adev->dev,
+					 "trigger_pc_sample_trap: count=%d skipping SQ_CMD — %d waves still trapped\n",
+					 trigger_count, amdkfd_gfx11_last_trapped_count);
+			kgd_gfx_v11_read_trapped_pcs(adev, inst, vmid);
+			return 0;
 		}
 		trigger_count++;
 		sq_pending_count =
@@ -1297,16 +1419,21 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 
 		/* Select SQ_CMD trigger policy. */
 		switch (policy) {
-		case AMDKFD_GFX11_PCS_SQCMD_BROADCAST:
-			mode = SQ_IND_CMD_MODE_BROADCAST;
-			set_wave_id = false;
+		case AMDKFD_GFX11_PCS_SQCMD_DEFAULT:
+			/* MODE_SINGLE + wave_id sweep (matches gfx9/gfx12) */
+			mode = SQ_IND_CMD_MODE_SINGLE;
+			check_vmid = 0;
+			set_wave_id = true;
+			wave_id = (*target_wave_slot) & 0xF;
 			break;
 		case AMDKFD_GFX11_PCS_SQCMD_NOOP:
 			issue_sqcmd = false;
 			break;
 		default:
-			/* MODE_SINGLE + wave_id sweep (matches gfx9/gfx12) */
-			wave_id = (*target_wave_slot) & 0xF;
+			/* BROADCAST + CHECK_VMID: trap all waves on target VMID.
+			 * This is the correct mode for GFX11.5 because MODE_SINGLE
+			 * targets specific wave slots that may be empty.
+			 */
 			break;
 		}
 
@@ -1337,6 +1464,8 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 			value = REG_SET_FIELD(value, SQ_CMD, WAVE_ID, wave_id);
 		value = REG_SET_FIELD(value, SQ_CMD, DATA, 0x4); /* TrapID 4 = HOSTTRAP */
 		value = REG_SET_FIELD(value, SQ_CMD, CHECK_VMID, check_vmid);
+		if (check_vmid)
+			value = REG_SET_FIELD(value, SQ_CMD, VM_ID, vmid);
 
 		if (log_this_call)
 			dev_info(adev->dev,
@@ -1378,8 +1507,10 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 				dev_info(adev->dev,
 					 "trigger_pc_sample_trap: FIRST regs vmid=%u TBA=0x%x_%x TMA=0x%x_%x GDBG=0x%x\n",
 					 vmid, tba_hi, tba_lo, tma_hi, tma_lo, gdbg);
-				/* Dump wave state to see trapped waves */
-				kgd_gfx_v11_dump_wave_trap_state(adev, inst, post_se, post_sh, vmid);
+				/* Skip dump_wave_trap_state - it's too slow and consumes
+				 * the trap handler's s_sleep window.  read_trapped_pcs
+				 * below has its own diagnostics.
+				 */
 			}
 			if (post_status && log_this_call)
 				dev_info(adev->dev,

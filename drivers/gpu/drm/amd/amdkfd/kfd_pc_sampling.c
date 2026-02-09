@@ -256,6 +256,7 @@ static int kfd_pc_sample_thread(void *param)
 			node->kfd2kgd->override_core_cg(adev, 1, inst);
 
 	while (!kthread_should_stop() &&
+			!amdgpu_in_reset(adev) &&
 			!signal_pending(node->pcs_data.hosttrap_entry.pc_sample_thread)) {
 		if (!need_wait) {
 			next_trap_time = ktime_add_us(ktime_get_raw(), timeout);
