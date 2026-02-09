@@ -7,6 +7,7 @@
 #ifndef AMDKCL_MM_H
 #define AMDKCL_MM_H
 
+#include <linux/version.h>
 #include <linux/sched/mm.h>
 #include <asm/page.h>
 #include <linux/mm_types.h>
@@ -28,7 +29,11 @@ extern void (*_kcl_mmput_async)(struct mm_struct *mm);
 #endif
 
 #ifndef HAVE_ZONE_DEVICE_PAGE_INIT
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+void zone_device_page_init(struct page *page, unsigned int order);
+#else
 void zone_device_page_init(struct page *page);
+#endif
 #endif
 
 #ifndef HAVE_FAULT_FLAG_ALLOW_RETRY_FIRST

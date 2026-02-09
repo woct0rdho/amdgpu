@@ -4,6 +4,7 @@
  *
  *  Copyright (C) 1991, 1992  Linus Torvalds
  */
+#include <linux/version.h>
 #include <linux/sched.h>
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -19,6 +20,7 @@ void __kcl_mmput_async(struct mm_struct *mm)
 #endif
 
 #ifndef HAVE_ZONE_DEVICE_PAGE_INIT
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 19, 0)
 /* copied from v6.0-rc3-597-g0dc45ca1ce18 mm/memremap.c and modified for kcl usage */
 void zone_device_page_init(struct page *page)
 {
@@ -29,6 +31,7 @@ void zone_device_page_init(struct page *page)
 	lock_page(page);
 }
 EXPORT_SYMBOL_GPL(zone_device_page_init);
+#endif
 #endif
 
 #ifndef HAVE_KMALLOC_SIZE_ROUNDUP

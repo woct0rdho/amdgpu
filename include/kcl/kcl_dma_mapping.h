@@ -2,6 +2,7 @@
 #ifndef AMDKCL_DMA_MAPPING_H
 #define AMDKCL_DMA_MAPPING_H
 
+#include <linux/version.h>
 #include <linux/dma-mapping.h>
 #include <linux/dma-map-ops.h>
 
@@ -130,8 +131,13 @@ static inline void dma_unmap_sgtable(struct device *dev, struct sg_table *sgt,
 
 static inline bool kcl_has_dma_map_resource_ops(struct device *dev)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+	/* map_resource member was removed in kernel 6.19 */
+	return true;
+#else
 	const struct dma_map_ops *ops = get_dma_ops(dev);
 	return ops == NULL || ops->map_resource != NULL;
+#endif
 }
 /*
  * v5.8-rc3-2-g68d237056e00 ("scatterlist: protect parameters of the sg_table related macros")

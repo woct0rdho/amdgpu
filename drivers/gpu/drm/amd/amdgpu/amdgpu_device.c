@@ -26,6 +26,7 @@
  *          Jerome Glisse
  */
 
+#include <linux/version.h>
 #include <linux/aperture.h>
 #include <linux/power_supply.h>
 #include <linux/kthread.h>
@@ -1749,7 +1750,11 @@ int amdgpu_device_resize_fb_bar(struct amdgpu_device *adev)
 
 	pci_release_resource(adev->pdev, 0);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+	r = pci_resize_resource(adev->pdev, 0, rbar_size, 0);
+#else
 	r = pci_resize_resource(adev->pdev, 0, rbar_size);
+#endif
 	if (r == -ENOSPC)
 		dev_info(adev->dev,
 			 "Not enough PCI address space for a large BAR.");
@@ -5340,7 +5345,11 @@ int amdgpu_device_suspend(struct drm_device *dev, bool notify_clients)
 		goto unwind_sriov;
 
 	if (notify_clients)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+		drm_client_dev_suspend(adev_to_drm(adev));
+#else
 		drm_client_dev_suspend(adev_to_drm(adev), false);
+#endif
 
 	cancel_delayed_work_sync(&adev->delayed_init_work);
 
@@ -5405,7 +5414,11 @@ unwind_smartshift:
 	}
 
 	if (notify_clients)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+		drm_client_dev_resume(adev_to_drm(adev));
+#else
 		drm_client_dev_resume(adev_to_drm(adev), false);
+#endif
 
 	amdgpu_ras_resume(adev);
 
@@ -5526,7 +5539,11 @@ exit:
 	flush_delayed_work(&adev->delayed_init_work);
 
 	if (notify_clients)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+		drm_client_dev_resume(adev_to_drm(adev));
+#else
 		drm_client_dev_resume(adev_to_drm(adev), false);
+#endif
 
 	amdgpu_ras_resume(adev);
 
@@ -6133,7 +6150,11 @@ int amdgpu_device_reinit_after_reset(struct amdgpu_reset_context *reset_context)
 				if (r)
 					goto out;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+				drm_client_dev_resume(adev_to_drm(tmp_adev));
+#else
 				drm_client_dev_resume(adev_to_drm(tmp_adev), false);
+#endif
 
 				/*
 				 * The GPU enters bad state once faulty pages
@@ -6471,7 +6492,11 @@ static void amdgpu_device_halt_activities(struct amdgpu_device *adev,
 		 */
 		amdgpu_unregister_gpu_instance(tmp_adev);
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+		drm_client_dev_suspend(adev_to_drm(tmp_adev));
+#else
 		drm_client_dev_suspend(adev_to_drm(tmp_adev), false);
+#endif
 
 		/* disable ras on ALL IPs */
 		if (!need_emergency_restart && !amdgpu_reset_in_dpc(adev) &&

@@ -20,6 +20,7 @@
  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
  * OTHER DEALINGS IN THE SOFTWARE.
  */
+#include <linux/version.h>
 #include <linux/types.h>
 #include <linux/dma-direction.h>
 #include <linux/dma-mapping.h>
@@ -220,7 +221,11 @@ svm_migrate_get_vram_page(struct svm_range *prange, unsigned long pfn)
 	page = pfn_to_page(pfn);
 	svm_range_bo_ref(prange->svm_bo);
 	page->zone_device_data = prange->svm_bo;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+	zone_device_page_init(page, 0);
+#else
 	zone_device_page_init(page);
+#endif
 }
 
 static void
@@ -580,6 +585,18 @@ out:
 	return r < 0 ? r : 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+static void svm_migrate_folio_free(struct folio *folio)
+{
+	struct page *page = &folio->page;
+	struct svm_range_bo *svm_bo = page->zone_device_data;
+
+	if (svm_bo) {
+		pr_debug_ratelimited("ref: %d\n", kref_read(&svm_bo->kref));
+		svm_range_bo_unref_async(svm_bo);
+	}
+}
+#else
 static void svm_migrate_page_free(struct page *page)
 {
 	struct svm_range_bo *svm_bo = page->zone_device_data;
@@ -589,6 +606,7 @@ static void svm_migrate_page_free(struct page *page)
 		svm_range_bo_unref_async(svm_bo);
 	}
 }
+#endif
 
 static int
 svm_migrate_copy_to_ram(struct amdgpu_device *adev, struct svm_range *prange,
@@ -1030,7 +1048,11 @@ out_mmput:
 }
 
 static const struct dev_pagemap_ops svm_migrate_pgmap_ops = {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+	.folio_free		= svm_migrate_folio_free,
+#else
 	.page_free		= svm_migrate_page_free,
+#endif
 	.migrate_to_ram		= svm_migrate_to_ram,
 };
 
