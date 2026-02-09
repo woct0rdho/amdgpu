@@ -1159,6 +1159,83 @@ static void program_trap_handler_settings_v11(struct amdgpu_device *adev,
 	unlock_srbm(adev);
 }
 
+/*
+ * Read PC samples directly from trapped waves via SQ_IND register interface.
+ * GFX11.5 workaround: the trap handler cannot do VMEM in trap context, so
+ * the kernel reads the original PC from TTMP0/TTMP1 while the trap handler
+ * holds the wave with s_sleep.
+ *
+ * Returns number of samples collected.
+ */
+static int kgd_gfx_v11_read_trapped_pcs(struct amdgpu_device *adev,
+					 uint32_t inst, uint32_t vmid)
+{
+	int se, sh, wave;
+	int num_se = adev->gfx.config.max_shader_engines;
+	int num_sh = adev->gfx.config.max_sh_per_se;
+	int samples = 0;
+	static int total_samples;
+
+	mutex_lock(&adev->grbm_idx_mutex);
+
+	for (se = 0; se < num_se; se++) {
+		for (sh = 0; sh < num_sh; sh++) {
+			amdgpu_gfx_select_se_sh(adev, se, sh,
+						0xFFFFFFFF, inst);
+
+			for (wave = 0; wave < 32; wave++) {
+				uint32_t status, hw_id2, ttmp0, ttmp1;
+				uint32_t wave_vmid;
+				u64 orig_pc;
+
+				status = kgd_gfx_v11_wave_read_ind(
+					adev, inst, wave, ixSQ_WAVE_STATUS);
+				/* Skip empty/invalid wave slots */
+				if (!(status & SQ_WAVE_STATUS__VALID_MASK))
+					continue;
+				/* Only interested in trapped waves */
+				if (!(status & SQ_WAVE_STATUS__TRAP_MASK))
+					continue;
+
+				hw_id2 = kgd_gfx_v11_wave_read_ind(
+					adev, inst, wave, ixSQ_WAVE_HW_ID2);
+				if (hw_id2 == 0xbebebeef)
+					continue;
+				wave_vmid = FIELD_GET(
+					SQ_WAVE_HW_ID2__VM_ID_MASK, hw_id2);
+				if (wave_vmid != vmid)
+					continue;
+
+				/* Read original PC saved by HW at trap entry */
+				ttmp0 = kgd_gfx_v11_wave_read_ind(
+					adev, inst, wave, ixSQ_WAVE_TTMP0);
+				ttmp1 = kgd_gfx_v11_wave_read_ind(
+					adev, inst, wave, ixSQ_WAVE_TTMP1);
+
+				/* PC = ttmp1[15:0]:ttmp0[31:0] */
+				orig_pc = ((u64)(ttmp1 & 0xFFFF) << 32) |
+					  ttmp0;
+
+				samples++;
+				total_samples++;
+				if (total_samples <= 20 ||
+				    total_samples % 100 == 0)
+					dev_info(adev->dev,
+						 "pcs_sample: #%d se=%d sh=%d wave=%d vmid=%u pc=0x%llx ttmp0=0x%x ttmp1=0x%x\n",
+						 total_samples, se, sh, wave,
+						 wave_vmid, orig_pc,
+						 ttmp0, ttmp1);
+			}
+		}
+	}
+
+	amdgpu_gfx_select_se_sh(adev, 0xFFFFFFFF, 0xFFFFFFFF,
+				0xFFFFFFFF, inst);
+	mutex_unlock(&adev->grbm_idx_mutex);
+
+	return samples;
+}
+
 static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 					    uint32_t vmid,
 					    uint32_t *target_simd,
@@ -1308,6 +1385,12 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 				dev_info(adev->dev,
 					 "trigger_pc_sample_trap: post_status=0x%x se=%d sh=%d\n",
 					 post_status, post_se, post_sh);
+
+			/* Read PC samples from trapped waves while they
+			 * are held in the trap handler's s_sleep loop.
+			 */
+			if (post_status)
+				kgd_gfx_v11_read_trapped_pcs(adev, inst, vmid);
 		}
 
 		/* Advance wave slot (same pattern as gfx12) */
