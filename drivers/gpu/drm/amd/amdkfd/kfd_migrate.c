@@ -222,7 +222,7 @@ svm_migrate_get_vram_page(struct svm_range *prange, unsigned long pfn)
 	svm_range_bo_ref(prange->svm_bo);
 	page->zone_device_data = prange->svm_bo;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
-	zone_device_page_init(page, 0);
+	zone_device_page_init(page, page_pgmap(page), 0);
 #else
 	zone_device_page_init(page);
 #endif

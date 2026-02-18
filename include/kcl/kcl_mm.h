@@ -30,7 +30,8 @@ extern void (*_kcl_mmput_async)(struct mm_struct *mm);
 
 #ifndef HAVE_ZONE_DEVICE_PAGE_INIT
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
-void zone_device_page_init(struct page *page, unsigned int order);
+void zone_device_page_init(struct page *page, struct dev_pagemap *pgmap,
+			   unsigned int order);
 #else
 void zone_device_page_init(struct page *page);
 #endif
