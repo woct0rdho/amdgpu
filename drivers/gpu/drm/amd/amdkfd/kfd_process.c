@@ -85,6 +85,8 @@ struct kfd_procfs_tree {
 
 static struct kfd_procfs_tree procfs;
 
+#define KFD_PROCFS_PID_KOBJ_ADD_RETRY_COUNT 3
+
 /*
  * Structure for SDMA activity tracking
  */
@@ -821,6 +823,34 @@ static void kfd_process_device_destroy_ib_mem(struct kfd_process_device *pdd)
 	kfd_process_free_gpuvm(qpd->ib_mem, pdd, &qpd->ib_kaddr);
 }
 
+static int kfd_process_add_procfs_pid_kobj(struct kfd_process *process)
+{
+	int ret = -ENOMEM;
+	int retry;
+
+	for (retry = 0; retry < KFD_PROCFS_PID_KOBJ_ADD_RETRY_COUNT; retry++) {
+		process->kobj = kfd_alloc_struct(process->kobj);
+		if (!process->kobj)
+			return -ENOMEM;
+
+		ret = kobject_init_and_add(process->kobj, &procfs_type,
+					   procfs.kobj, "%d",
+					   (int)process->lead_thread->pid);
+		if (!ret)
+			return 0;
+
+		kobject_put(process->kobj);
+		process->kobj = NULL;
+
+		if (ret != -EEXIST)
+			return ret;
+
+		flush_workqueue(kfd_process_wq);
+	}
+
+	return ret;
+}
+
 struct kfd_process *kfd_create_process(struct task_struct *thread)
 {
 	struct kfd_process *process;
@@ -870,18 +900,10 @@ struct kfd_process *kfd_create_process(struct task_struct *thread)
 		if (!procfs.kobj)
 			goto out;
 
-		process->kobj = kfd_alloc_struct(process->kobj);
-		if (!process->kobj) {
-			pr_warn("Creating procfs kobject failed");
-			goto out;
-		}
-		ret = kobject_init_and_add(process->kobj, &procfs_type,
-					   procfs.kobj, "%d",
-					   (int)process->lead_thread->pid);
+		ret = kfd_process_add_procfs_pid_kobj(process);
 		if (ret) {
-			pr_warn("Creating procfs pid directory failed");
-			kobject_put(process->kobj);
-			process->kobj = NULL;
+			pr_warn("Creating procfs pid directory failed for pid %d (%d)",
+				(int)process->lead_thread->pid, ret);
 			goto out;
 		}
 
