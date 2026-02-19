@@ -825,28 +825,26 @@ static void kfd_process_device_destroy_ib_mem(struct kfd_process_device *pdd)
 
 static int kfd_process_add_procfs_pid_kobj(struct kfd_process *process)
 {
-	int ret = -ENOMEM;
-	int retry;
+	int ret;
 
-	for (retry = 0; retry < KFD_PROCFS_PID_KOBJ_ADD_RETRY_COUNT; retry++) {
-		process->kobj = kfd_alloc_struct(process->kobj);
-		if (!process->kobj)
-			return -ENOMEM;
+	if (!procfs.kobj)
+		return -ENOENT;
 
-		ret = kobject_init_and_add(process->kobj, &procfs_type,
-					   procfs.kobj, "%d",
-					   (int)process->lead_thread->pid);
-		if (!ret)
-			return 0;
+	if (process->kobj)
+		return 0;
 
-		kobject_put(process->kobj);
-		process->kobj = NULL;
+	process->kobj = kfd_alloc_struct(process->kobj);
+	if (!process->kobj)
+		return -ENOMEM;
 
-		if (ret != -EEXIST)
-			return ret;
+	ret = kobject_init_and_add(process->kobj, &procfs_type,
+				   procfs.kobj, "%d",
+				   (int)process->lead_thread->pid);
+	if (!ret)
+		return 0;
 
-		flush_workqueue(kfd_process_wq);
-	}
+	kobject_put(process->kobj);
+	process->kobj = NULL;
 
 	return ret;
 }
@@ -855,6 +853,7 @@ struct kfd_process *kfd_create_process(struct task_struct *thread)
 {
 	struct kfd_process *process;
 	int ret;
+	int retry;
 
 	if (!(thread->mm && mmget_not_zero(thread->mm)))
 		return ERR_PTR(-EINVAL);
@@ -896,11 +895,27 @@ struct kfd_process *kfd_create_process(struct task_struct *thread)
 		process = create_process(thread);
 		if (IS_ERR(process))
 			goto out;
+		init_waitqueue_head(&process->wait_irq_drain);
 
 		if (!procfs.kobj)
 			goto out;
 
-		ret = kfd_process_add_procfs_pid_kobj(process);
+		for (retry = 0; retry < KFD_PROCFS_PID_KOBJ_ADD_RETRY_COUNT;
+		     retry++) {
+			ret = kfd_process_add_procfs_pid_kobj(process);
+			if (!ret || ret != -EEXIST)
+				break;
+
+			mutex_unlock(&kfd_processes_mutex);
+			flush_workqueue(kfd_process_wq);
+			mutex_lock(&kfd_processes_mutex);
+
+			if (!procfs.kobj) {
+				ret = -ENOENT;
+				break;
+			}
+		}
+
 		if (ret) {
 			pr_warn("Creating procfs pid directory failed for pid %d (%d)",
 				(int)process->lead_thread->pid, ret);
@@ -920,8 +935,6 @@ struct kfd_process *kfd_create_process(struct task_struct *thread)
 		kfd_procfs_add_sysfs_counters(process);
 
 		kfd_debugfs_add_process(process);
-
-		init_waitqueue_head(&process->wait_irq_drain);
 	}
 out:
 	mutex_unlock(&kfd_processes_mutex);
