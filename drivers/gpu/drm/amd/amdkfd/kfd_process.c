@@ -543,6 +543,14 @@ static void kfd_sysfs_create_file(struct kobject *kobj, struct attribute *attr,
 		pr_warn("Create sysfs %s/%s failed %d", kobj->name, name, ret);
 }
 
+static void kfd_sysfs_remove_file(struct kobject *kobj, struct attribute *attr)
+{
+	if (!kobj || !attr || !attr->name)
+		return;
+
+	sysfs_remove_file(kobj, attr);
+}
+
 static void kfd_procfs_add_sysfs_stats(struct kfd_process *p)
 {
 	int ret;
@@ -667,9 +675,9 @@ void kfd_procfs_del_queue(struct queue *q)
 	if (!q)
 		return;
 
-	sysfs_remove_file(&q->kobj, &q->attr_gpuid);
-	sysfs_remove_file(&q->kobj, &q->attr_size);
-	sysfs_remove_file(&q->kobj, &q->attr_type);
+	kfd_sysfs_remove_file(&q->kobj, &q->attr_gpuid);
+	kfd_sysfs_remove_file(&q->kobj, &q->attr_size);
+	kfd_sysfs_remove_file(&q->kobj, &q->attr_type);
 
 	kobject_del(&q->kobj);
 	kobject_put(&q->kobj);
@@ -873,6 +881,7 @@ struct kfd_process *kfd_create_process(struct task_struct *thread)
 		if (ret) {
 			pr_warn("Creating procfs pid directory failed");
 			kobject_put(process->kobj);
+			process->kobj = NULL;
 			goto out;
 		}
 
@@ -1112,32 +1121,40 @@ static void kfd_process_remove_sysfs(struct kfd_process *p)
 	if (!p->kobj)
 		return;
 
-	sysfs_remove_file(p->kobj, &p->attr_pasid);
-	kobject_del(p->kobj_queues);
-	kobject_put(p->kobj_queues);
-	p->kobj_queues = NULL;
+	kfd_sysfs_remove_file(p->kobj, &p->attr_pasid);
+	if (p->kobj_queues) {
+		kobject_del(p->kobj_queues);
+		kobject_put(p->kobj_queues);
+		p->kobj_queues = NULL;
+	}
 
 	for (i = 0; i < p->n_pdds; i++) {
 		pdd = p->pdds[i];
+		if (!pdd)
+			continue;
 
-		sysfs_remove_file(p->kobj, &pdd->attr_vram);
-		sysfs_remove_file(p->kobj, &pdd->attr_sdma);
+		kfd_sysfs_remove_file(p->kobj, &pdd->attr_vram);
+		kfd_sysfs_remove_file(p->kobj, &pdd->attr_sdma);
 
-		sysfs_remove_file(pdd->kobj_stats, &pdd->attr_evict);
-		if (pdd->dev->kfd2kgd->get_cu_occupancy)
-			sysfs_remove_file(pdd->kobj_stats,
-					  &pdd->attr_cu_occupancy);
-		kobject_del(pdd->kobj_stats);
-		kobject_put(pdd->kobj_stats);
-		pdd->kobj_stats = NULL;
+		if (pdd->kobj_stats) {
+			kfd_sysfs_remove_file(pdd->kobj_stats, &pdd->attr_evict);
+			if (pdd->dev->kfd2kgd->get_cu_occupancy)
+				kfd_sysfs_remove_file(pdd->kobj_stats,
+						      &pdd->attr_cu_occupancy);
+			kobject_del(pdd->kobj_stats);
+			kobject_put(pdd->kobj_stats);
+			pdd->kobj_stats = NULL;
+		}
 	}
 
 	for_each_set_bit(i, p->svms.bitmap_supported, p->n_pdds) {
 		pdd = p->pdds[i];
+		if (!pdd || !pdd->kobj_counters)
+			continue;
 
-		sysfs_remove_file(pdd->kobj_counters, &pdd->attr_faults);
-		sysfs_remove_file(pdd->kobj_counters, &pdd->attr_page_in);
-		sysfs_remove_file(pdd->kobj_counters, &pdd->attr_page_out);
+		kfd_sysfs_remove_file(pdd->kobj_counters, &pdd->attr_faults);
+		kfd_sysfs_remove_file(pdd->kobj_counters, &pdd->attr_page_in);
+		kfd_sysfs_remove_file(pdd->kobj_counters, &pdd->attr_page_out);
 		kobject_del(pdd->kobj_counters);
 		kobject_put(pdd->kobj_counters);
 		pdd->kobj_counters = NULL;
