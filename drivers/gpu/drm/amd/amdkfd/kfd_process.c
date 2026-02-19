@@ -903,7 +903,7 @@ struct kfd_process *kfd_create_process(struct task_struct *thread)
 		for (retry = 0; retry < KFD_PROCFS_PID_KOBJ_ADD_RETRY_COUNT;
 		     retry++) {
 			ret = kfd_process_add_procfs_pid_kobj(process);
-			if (!ret || ret != -EEXIST)
+			if (ret != -EEXIST)
 				break;
 
 			mutex_unlock(&kfd_processes_mutex);
@@ -912,6 +912,14 @@ struct kfd_process *kfd_create_process(struct task_struct *thread)
 
 			if (!procfs.kobj) {
 				ret = -ENOENT;
+				break;
+			}
+
+			/* Verify our process wasn't destroyed while
+			 * we dropped the mutex.
+			 */
+			if (find_process(thread, false) != process) {
+				ret = -ESRCH;
 				break;
 			}
 		}
