@@ -49,6 +49,19 @@ enum kfd_preempt_type {
 	KFD_PREEMPT_TYPE_WAVEFRONT_SAVE
 };
 
+/* PC sample record — must match perf_sample_hosttrap_v1_t layout (64 bytes) */
+struct kfd_pcs_sample {
+	uint64_t pc;
+	uint64_t exec_mask;
+	uint32_t workgroup_id[3];
+	uint32_t chiplet_info;   /* wave_in_wg:6, chiplet:3, reserved:23 */
+	uint32_t hw_id;
+	uint32_t reserved0;
+	uint64_t reserved1;
+	uint64_t timestamp;
+	uint64_t correlation_id;
+};
+
 struct kfd_vm_fault_info {
 	uint64_t	page_addr;
 	uint32_t	vmid;
@@ -347,6 +360,13 @@ struct kfd2kgd_calls {
 					uint32_t *target_wave_slot,
 					enum kfd_ioctl_pc_sample_method method,
 					uint32_t inst);
+	/* Read PCs directly from running waves (GFX11.5 direct-read).
+	 * Fills sample_buf with kfd_pcs_sample structs.
+	 * Returns number of samples written, or negative on error.
+	 */
+	int (*read_wave_pcs)(struct amdgpu_device *adev, uint32_t vmid,
+			     struct kfd_pcs_sample *sample_buf,
+			     int max_samples, uint32_t inst);
 	void (*override_core_cg)(struct amdgpu_device *adev,
 					uint32_t value,
 					uint32_t inst);

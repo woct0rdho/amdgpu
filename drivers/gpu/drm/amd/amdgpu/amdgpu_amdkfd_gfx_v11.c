@@ -905,27 +905,22 @@ static void program_trap_handler_settings_v11(struct amdgpu_device *adev,
 }
 
 /*
- * Read PC samples directly from trapped waves via SQ_IND register interface.
+ * Read PC samples directly from running waves via SQ_IND register interface.
  * GFX11.5 PC sampling: read PCs directly from running waves.
  *
  * Control registers (STATUS, HW_ID2, PC_LO, PC_HI) read reliably via
  * SQ_IND for any wave — no need to trap or halt.  TTMP/SGPR reads are
  * unreliable (~80% zero) on GFX11 because there is no FORCE_READ bit.
  *
- * By reading PC from running waves we avoid:
- *  - TTMP zero reads (the whole reason trapping was needed)
- *  - Re-trap stuck waves (BROADCAST SQ_CMD + PRIV=1 = infinite loop)
- *  - MES teardown hang (no trapped waves blocking queue suspend)
- *
- * The PC read is the "next instruction to issue" (ISA spec).  For a wave
- * stalled on memory, this is the stalled instruction — exactly what PC
- * sampling wants.  Slight imprecision from the wave advancing between
- * STATUS read and PC read is acceptable for statistical sampling.
+ * Fills sample_buf with kfd_pcs_sample structs (64 bytes each, matching
+ * perf_sample_hosttrap_v1_t layout).
  *
  * Returns number of samples collected.
  */
 static int kgd_gfx_v11_read_wave_pcs(struct amdgpu_device *adev,
-				      uint32_t inst, uint32_t vmid)
+				      uint32_t vmid,
+				      struct kfd_pcs_sample *sample_buf,
+				      int max_samples, uint32_t inst)
 {
 	int se, sh, wgp, simd, wave;
 	int num_se = adev->gfx.config.max_shader_engines;
@@ -938,11 +933,11 @@ static int kgd_gfx_v11_read_wave_pcs(struct amdgpu_device *adev,
 	static int total_samples;
 	static int call_count;
 
-	if (amdgpu_in_reset(adev)) {
-		dev_info_ratelimited(adev->dev,
-			"read_pcs: skipping — GPU reset in progress\n");
+	if (amdgpu_in_reset(adev))
 		return 0;
-	}
+
+	if (!sample_buf || max_samples <= 0)
+		return 0;
 
 	if (!max_waves || max_waves > 16)
 		max_waves = 16;
@@ -954,9 +949,6 @@ static int kgd_gfx_v11_read_wave_pcs(struct amdgpu_device *adev,
 	  for (sh = 0; sh < num_sh; sh++) {
 	    for (wgp = 0; wgp < num_wgp; wgp++) {
 	      for (simd = 0; simd < 4; simd++) {
-		/* GFX10+: INSTANCE = (wgp << 2) | simd
-		 * (matches umr's MANY_TO_INSTANCE macro)
-		 */
 		amdgpu_gfx_select_se_sh(adev, se, sh,
 					(wgp << 2) | simd, inst);
 
@@ -965,14 +957,14 @@ static int kgd_gfx_v11_read_wave_pcs(struct amdgpu_device *adev,
 			uint32_t wave_vmid;
 			u32 pc_lo, pc_hi;
 			u64 pc;
+			struct kfd_pcs_sample *s;
+
+			if (samples >= max_samples)
+				goto done;
 
 			status = kgd_gfx_v11_wave_read_ind(
 				adev, inst, wave, ixSQ_WAVE_STATUS);
 
-			/* Bits 30-31 reserved; non-zero = corruption.
-			 * Bits 24-29 are valid (NO_VGPRS, LDS_PARAM_READY,
-			 * MUST_GS_ALLOC, MUST_EXPORT, IDLE, SCRATCH_EN).
-			 */
 			if (status & 0xC0000000) {
 				corrupt_count++;
 				continue;
@@ -982,10 +974,6 @@ static int kgd_gfx_v11_read_wave_pcs(struct amdgpu_device *adev,
 				continue;
 			valid_count++;
 
-			/* Skip waves in trap handler (PRIV=1) —
-			 * their PC is the trap handler address,
-			 * not user code.
-			 */
 			if (status & SQ_WAVE_STATUS__PRIV_MASK) {
 				priv_count++;
 				continue;
@@ -1002,29 +990,29 @@ static int kgd_gfx_v11_read_wave_pcs(struct amdgpu_device *adev,
 				continue;
 			vmid_match++;
 
-			/* Read PC directly — control registers
-			 * are reliable via SQ_IND on GFX11.
-			 */
 			pc_lo = kgd_gfx_v11_wave_read_ind(
 				adev, inst, wave, ixSQ_WAVE_PC_LO);
 			pc_hi = kgd_gfx_v11_wave_read_ind(
 				adev, inst, wave, ixSQ_WAVE_PC_HI);
 			pc = ((u64)pc_hi << 32) | pc_lo;
 
+			/* Skip sentinel-corrupted PCs */
+			if (pc_lo == 0xbebebeef || pc_hi == 0xbebebeef)
+				continue;
+
+			s = &sample_buf[samples];
+			memset(s, 0, sizeof(*s));
+			s->pc = pc;
+			s->hw_id = hw_id2;
+			s->timestamp = ktime_get_raw_ns();
+
 			samples++;
 			total_samples++;
 
-			if (call_count <= 3 && vmid_match <= 8)
+			if (call_count <= 3 && samples <= 4)
 				dev_info(adev->dev,
-					 "read_pcs: call=%d se=%d sh=%d wgp=%d simd=%d wave=%d status=0x%x vmid=%u pc=0x%llx\n",
+					 "read_pcs: call=%d se=%d sh=%d wgp=%d simd=%d wave=%d vmid=%u pc=0x%llx\n",
 					 call_count, se, sh, wgp, simd,
-					 wave, status, wave_vmid, pc);
-
-			if (total_samples <= 20 ||
-			    total_samples % 10000 == 0)
-				dev_info(adev->dev,
-					 "pcs_sample: #%d se=%d sh=%d wgp=%d simd=%d wave=%d vmid=%u pc=0x%llx\n",
-					 total_samples, se, sh, wgp, simd,
 					 wave, wave_vmid, pc);
 		}
 	      }
@@ -1032,16 +1020,14 @@ static int kgd_gfx_v11_read_wave_pcs(struct amdgpu_device *adev,
 	  }
 	}
 
+done:
 	amdgpu_gfx_select_se_sh(adev, 0xFFFFFFFF, 0xFFFFFFFF,
 				0xFFFFFFFF, inst);
 	mutex_unlock(&adev->grbm_idx_mutex);
 
-	/* No longer tracking trapped waves — always zero for the
-	 * re-trap guard in trigger_pc_sample_trap.
-	 */
 	amdkfd_gfx11_last_trapped_count = 0;
 
-	if (call_count <= 10 || (samples > 0 && (total_samples <= 50 || total_samples % 1000 == 0)))
+	if (call_count <= 10 || (samples > 0 && (total_samples % 5000 == 0)))
 		dev_info(adev->dev,
 			 "read_pcs: call=%d valid=%d priv=%d vmid_match=%d samples=%d total=%d corrupt=%d\n",
 			 call_count, valid_count, priv_count, vmid_match, samples, total_samples, corrupt_count);
@@ -1094,7 +1080,7 @@ static uint32_t kgd_gfx_v11_trigger_pc_sample_trap(struct amdgpu_device *adev,
 		 * No SQ_CMD trap — avoids TTMP zero reads, re-trap stuck waves,
 		 * and MES teardown hang.
 		 */
-		kgd_gfx_v11_read_wave_pcs(adev, inst, vmid);
+		kgd_gfx_v11_read_wave_pcs(adev, vmid, NULL, 0, inst);
 	} else {
 		dev_dbg(adev->dev, "PC Sampling method %d not supported.", method);
 		return -EOPNOTSUPP;
@@ -1129,5 +1115,6 @@ const struct kfd2kgd_calls gfx_v11_kfd2kgd = {
 	.hqd_get_pq_addr = kgd_gfx_v11_hqd_get_pq_addr,
 	.hqd_reset = kgd_gfx_v11_hqd_reset,
 	.hqd_sdma_get_doorbell = kgd_gfx_v11_hqd_sdma_get_doorbell,
-	.trigger_pc_sample_trap = kgd_gfx_v11_trigger_pc_sample_trap
+	.trigger_pc_sample_trap = kgd_gfx_v11_trigger_pc_sample_trap,
+	.read_wave_pcs = kgd_gfx_v11_read_wave_pcs
 };

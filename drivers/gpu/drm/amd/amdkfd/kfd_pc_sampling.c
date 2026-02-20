@@ -28,6 +28,8 @@
 #include "kfd_device_queue_manager.h"
 
 #include <linux/bitops.h>
+#include <linux/sched/mm.h>
+#include <linux/mmu_context.h>
 /*
  * PC Sampling revision change log
  *
@@ -202,6 +204,59 @@ static void kfd_pc_sampling_dump_vmid_maps(struct kfd_node *node,
 		tag, sw_nonzero, atc_valid, sw_match, atc_match);
 }
 
+/*
+ * device_data (pcs_sampling_data_t) offsets — must match ROCr layout.
+ * Header is 64 bytes, then buffer0[buf_size] and buffer1[buf_size] follow.
+ */
+#define PCS_DD_BUF_WRITE_VAL    0x00   /* u64: (buf_idx<<63) | count */
+#define PCS_DD_BUF_SIZE         0x08   /* u32: samples per buffer */
+#define PCS_DD_BUF_WRITTEN0     0x10   /* u32: count in buffer 0 */
+#define PCS_DD_BUF_WRITTEN1     0x20   /* u32: count in buffer 1 */
+#define PCS_DD_HDR_SIZE         0x40   /* header size in bytes */
+#define PCS_SAMPLE_SIZE         64     /* sizeof(perf_sample_hosttrap_v1_t) */
+#define PCS_MAX_KERNEL_SAMPLES  2048
+
+/*
+ * Write samples from kernel buffer to userspace device_data.
+ * Must be called with kthread_use_mm() active.
+ * Returns number of samples written, or negative on error.
+ */
+static int pcs_write_to_device_data(u64 device_data_va, u32 buf_size,
+				    struct kfd_pcs_sample *samples,
+				    int n_samples, u64 *total_written)
+{
+	u64 __user *bwv_ptr = (u64 __user *)device_data_va;
+	u64 bwv;
+	int active, count, avail, to_write;
+	u64 buf_base;
+
+	if (get_user(bwv, bwv_ptr))
+		return -EFAULT;
+
+	active = (int)(bwv >> 63);
+	count = (int)(bwv & ~(1ULL << 63));
+
+	avail = buf_size - count;
+	if (avail <= 0)
+		return 0;
+
+	to_write = min(n_samples, avail);
+
+	buf_base = device_data_va + PCS_DD_HDR_SIZE +
+		   (u64)active * buf_size * PCS_SAMPLE_SIZE;
+
+	if (copy_to_user((void __user *)(buf_base + (u64)count * PCS_SAMPLE_SIZE),
+			 samples, to_write * PCS_SAMPLE_SIZE))
+		return -EFAULT;
+
+	/* Update buf_write_val: keep buffer index, new count */
+	if (put_user(((u64)active << 63) | (count + to_write), bwv_ptr))
+		return -EFAULT;
+
+	*total_written += to_write;
+	return to_write;
+}
+
 static int kfd_pc_sample_thread(void *param)
 {
 	struct amdgpu_device *adev;
@@ -212,6 +267,14 @@ static int kfd_pc_sample_thread(void *param)
 	bool need_wait;
 	uint32_t inst;
 	uint32_t target_vmid;
+	/* Delivery state */
+	struct kfd_pcs_sample *sample_buf = NULL;
+	struct kfd_process *proc = NULL;
+	struct mm_struct *mm = NULL;
+	u64 device_data_va = 0;
+	u32 buf_size = 0;
+	u64 total_delivered = 0;
+	bool have_delivery = false;
 
 	mutex_lock(&node->pcs_data.mutex);
 	if (node->pcs_data.hosttrap_entry.base.active_count &&
@@ -228,25 +291,76 @@ static int kfd_pc_sample_thread(void *param)
 	}
 	mutex_unlock(&node->pcs_data.mutex);
 	if (!timeout) {
-		pr_warn("pcs hosttrap: thread init disabled active_count=%u interval=%llu trigger=%px method=%u owner_pasid=%u target_vmid=%u\n",
-			READ_ONCE(node->pcs_data.hosttrap_entry.base.active_count),
-			node->pcs_data.hosttrap_entry.base.pc_sample_info.interval,
-			node->kfd2kgd ? node->kfd2kgd->trigger_pc_sample_trap : NULL,
-			node->pcs_data.hosttrap_entry.base.pc_sample_info.method,
-			READ_ONCE(node->pcs_data.hosttrap_entry.owner_pasid),
-			READ_ONCE(node->pcs_data.hosttrap_entry.target_vmid));
+		pr_warn("pcs hosttrap: thread init disabled\n");
 		return -EINVAL;
 	}
 
-	pr_warn("pcs hosttrap: thread init active_count=%u interval_us=%u owner_pasid=%u target_vmid=%u method=%u trigger=%px\n",
-		READ_ONCE(node->pcs_data.hosttrap_entry.base.active_count),
+	adev = node->adev;
+
+	/* Set up delivery: allocate buffer, look up process, read device_data VA */
+	if (node->kfd2kgd->read_wave_pcs) {
+		uint32_t owner_pasid;
+
+		sample_buf = kvmalloc_array(PCS_MAX_KERNEL_SAMPLES,
+					    sizeof(struct kfd_pcs_sample),
+					    GFP_KERNEL | __GFP_ZERO);
+		if (!sample_buf) {
+			pr_warn("pcs: failed to allocate sample buffer\n");
+			goto skip_delivery_init;
+		}
+
+		owner_pasid = READ_ONCE(node->pcs_data.hosttrap_entry.owner_pasid);
+		proc = kfd_lookup_process_by_pasid(owner_pasid, NULL);
+		if (!proc) {
+			pr_warn("pcs: process not found for pasid=%u\n", owner_pasid);
+			goto skip_delivery_init;
+		}
+
+		mm = get_task_mm(proc->lead_thread);
+		if (!mm) {
+			pr_warn("pcs: failed to get mm for pasid=%u\n", owner_pasid);
+			goto skip_delivery_init;
+		}
+
+		/* Read device_data VA from TMA[0] */
+		{
+			u64 tma_addr = READ_ONCE(
+				node->pcs_data.hosttrap_entry.trap_tma_addr);
+			if (tma_addr) {
+				kthread_use_mm(mm);
+				if (get_user(device_data_va,
+					     (u64 __user *)tma_addr)) {
+					pr_warn("pcs: failed to read TMA[0] at 0x%llx\n",
+						tma_addr);
+					device_data_va = 0;
+				}
+				if (device_data_va) {
+					if (get_user(buf_size,
+						     (u32 __user *)(device_data_va +
+								   PCS_DD_BUF_SIZE)))
+						buf_size = 0;
+				}
+				kthread_unuse_mm(mm);
+			}
+		}
+
+		if (device_data_va && buf_size) {
+			have_delivery = true;
+			pr_warn("pcs: delivery init OK device_data=0x%llx buf_size=%u\n",
+				device_data_va, buf_size);
+		} else {
+			pr_warn("pcs: delivery init failed device_data=0x%llx buf_size=%u\n",
+				device_data_va, buf_size);
+		}
+	}
+
+skip_delivery_init:
+	pr_warn("pcs hosttrap: thread init interval_us=%u owner_pasid=%u target_vmid=%u delivery=%d\n",
 		timeout,
 		READ_ONCE(node->pcs_data.hosttrap_entry.owner_pasid),
 		READ_ONCE(node->pcs_data.hosttrap_entry.target_vmid),
-		node->pcs_data.hosttrap_entry.base.pc_sample_info.method,
-		node->kfd2kgd ? node->kfd2kgd->trigger_pc_sample_trap : NULL);
+		have_delivery);
 
-	adev = node->adev;
 	need_wait = false;
 	allow_signal(SIGKILL);
 	target_vmid = node->pcs_data.hosttrap_entry.target_vmid;
@@ -269,14 +383,12 @@ static int kfd_pc_sample_thread(void *param)
 				if (resolved_vmid) {
 					WRITE_ONCE(node->pcs_data.hosttrap_entry.target_vmid, resolved_vmid);
 					target_vmid = resolved_vmid;
-					pr_warn("pc sample trigger resolved target_vmid=%u from owner_pasid=%u via ATC map\n",
+					pr_warn("pcs: resolved target_vmid=%u from pasid=%u\n",
 						target_vmid, owner_pasid);
 				}
 			}
 			if (!target_vmid) {
-				pr_warn_ratelimited("pc sample trigger skipped: target_vmid=0 owner_pasid=%u active_count=%u (waiting for queue VMID assignment)\n",
-					READ_ONCE(node->pcs_data.hosttrap_entry.owner_pasid),
-					READ_ONCE(node->pcs_data.hosttrap_entry.base.active_count));
+				pr_warn_ratelimited("pcs: skipped, target_vmid=0\n");
 				need_wait = true;
 				continue;
 			}
@@ -286,47 +398,49 @@ static int kfd_pc_sample_thread(void *param)
 				uint64_t tma_addr = READ_ONCE(node->pcs_data.hosttrap_entry.trap_tma_addr);
 
 				if (tba_addr || tma_addr) {
-					pr_warn("pcs hosttrap: trigger program trap regs vmid=%u tba=0x%llx tma=0x%llx owner_pasid=%u\n",
-						target_vmid, tba_addr, tma_addr,
-						READ_ONCE(node->pcs_data.hosttrap_entry.owner_pasid));
 					for_each_inst(inst, node->xcc_mask)
 						node->kfd2kgd->program_trap_handler_settings(
 							adev, target_vmid, tba_addr, tma_addr, inst);
 					WRITE_ONCE(node->pcs_data.hosttrap_entry.trap_regs_programmed_vmid,
 						   target_vmid);
-				} else {
-					pr_warn_ratelimited("pcs hosttrap: trigger program trap regs skipped (missing tba/tma) vmid=%u owner_pasid=%u\n",
-						target_vmid,
-						READ_ONCE(node->pcs_data.hosttrap_entry.owner_pasid));
 				}
 			}
 
-			for_each_inst(inst, node->xcc_mask) {
-				int ret;
+			/* Read wave PCs and deliver to userspace */
+			if (have_delivery) {
+				int n_samples = 0;
 
-				ret = node->kfd2kgd->trigger_pc_sample_trap(adev, target_vmid,
-					&node->pcs_data.hosttrap_entry.target_simd,
-					&node->pcs_data.hosttrap_entry.target_wave_slot,
-					node->pcs_data.hosttrap_entry.base.pc_sample_info.method,
-					inst);
-				if (ret)
-					pr_warn_ratelimited("pc sample trigger failed vmid=%d inst=%u ret=%d method=%u simd=%u wave_slot=%u\n",
-						target_vmid, inst, ret,
+				for_each_inst(inst, node->xcc_mask) {
+					n_samples = node->kfd2kgd->read_wave_pcs(
+						adev, target_vmid, sample_buf,
+						PCS_MAX_KERNEL_SAMPLES, inst);
+				}
+
+				if (n_samples > 0) {
+					kthread_use_mm(mm);
+					pcs_write_to_device_data(
+						device_data_va, buf_size,
+						sample_buf, n_samples,
+						&total_delivered);
+					kthread_unuse_mm(mm);
+				}
+			} else {
+				/* Fallback: trigger without delivery */
+				for_each_inst(inst, node->xcc_mask) {
+					node->kfd2kgd->trigger_pc_sample_trap(
+						adev, target_vmid,
+						&node->pcs_data.hosttrap_entry.target_simd,
+						&node->pcs_data.hosttrap_entry.target_wave_slot,
 						node->pcs_data.hosttrap_entry.base.pc_sample_info.method,
-						node->pcs_data.hosttrap_entry.target_simd,
-						node->pcs_data.hosttrap_entry.target_wave_slot);
+						inst);
+				}
 			}
+
 			trigger_loop_count++;
-			if (trigger_loop_count <= 8 || !(trigger_loop_count % 1000)) {
-				pr_warn("pcs hosttrap: trigger loop=%llu owner_pasid=%u target_vmid=%u active_count=%u simd=%u wave_slot=%u\n",
-					trigger_loop_count,
-					READ_ONCE(node->pcs_data.hosttrap_entry.owner_pasid),
-					target_vmid,
-					READ_ONCE(node->pcs_data.hosttrap_entry.base.active_count),
-					node->pcs_data.hosttrap_entry.target_simd,
-					node->pcs_data.hosttrap_entry.target_wave_slot);
-			}
-			pr_debug_ratelimited("triggered a host trap.");
+			if (trigger_loop_count <= 5 || !(trigger_loop_count % 2000))
+				pr_warn("pcs: loop=%llu vmid=%u delivered=%llu\n",
+					trigger_loop_count, target_vmid,
+					total_delivered);
 			need_wait = true;
 		} else {
 			ktime_t wait_time;
@@ -344,9 +458,20 @@ static int kfd_pc_sample_thread(void *param)
 			}
 		}
 	}
+
+	pr_warn("pcs: thread exiting, total_delivered=%llu loops=%llu\n",
+		total_delivered, trigger_loop_count);
+
 	if (node->kfd2kgd->override_core_cg)
 		for_each_inst(inst, node->xcc_mask)
 			node->kfd2kgd->override_core_cg(adev, 0, inst);
+
+	/* Cleanup */
+	if (mm)
+		mmput(mm);
+	if (proc)
+		kfd_unref_process(proc);
+	kvfree(sample_buf);
 
 	node->pcs_data.hosttrap_entry.target_simd = 0;
 	node->pcs_data.hosttrap_entry.target_wave_slot = 0;
