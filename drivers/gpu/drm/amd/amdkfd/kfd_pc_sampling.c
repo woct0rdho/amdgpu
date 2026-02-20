@@ -317,6 +317,13 @@ static int kfd_pc_sample_thread(void *param)
 		}
 
 		mm = get_task_mm(proc->lead_thread);
+		/* Release process ref immediately to avoid circular ref:
+		 * thread holds proc ref → proc refcount never 0 →
+		 * kfd_process_wq_release (which stops thread) never runs.
+		 * We only need mm, not proc.
+		 */
+		kfd_unref_process(proc);
+		proc = NULL;
 		if (!mm) {
 			pr_warn("pcs: failed to get mm for pasid=%u\n", owner_pasid);
 			goto skip_delivery_init;
@@ -755,7 +762,10 @@ static int kfd_pc_sample_stop(struct kfd_process_device *pdd,
 
 	if (pc_sampling_stop) {
 		if (pcs_entry->method == KFD_IOCTL_PCS_METHOD_HOSTTRAP) {
-			kthread_stop(pdd->dev->pcs_data.hosttrap_entry.pc_sample_thread);
+			struct task_struct *t =
+				READ_ONCE(pdd->dev->pcs_data.hosttrap_entry.pc_sample_thread);
+			if (t)
+				kthread_stop(t);
 		} else {/* KFD_IOCTL_PCS_METHOD_STOCHASTIC */
 			struct amdgpu_device *adev = pdd->dev->adev;
 			struct kfd_node *node = pdd->dev;
