@@ -269,8 +269,7 @@ static int kfd_pc_sample_thread(void *param)
 	uint32_t target_vmid;
 	/* Delivery state */
 	struct kfd_pcs_sample *sample_buf = NULL;
-	struct kfd_process *proc = NULL;
-	struct mm_struct *mm = NULL;
+	struct task_struct *lead_thread = NULL;
 	u64 device_data_va = 0;
 	u32 buf_size = 0;
 	u64 total_delivered = 0;
@@ -297,9 +296,19 @@ static int kfd_pc_sample_thread(void *param)
 
 	adev = node->adev;
 
-	/* Set up delivery: allocate buffer, look up process, read device_data VA */
+	/* Set up delivery: allocate buffer, look up process, read device_data VA.
+	 *
+	 * IMPORTANT: We must NOT hold mm_users or process ref across iterations.
+	 * Holding mm_users prevents exit_mmap → mmu_notifier_release →
+	 * kfd_process_notifier_release, which is the ONLY KFD process cleanup
+	 * path. Instead, we hold a task_struct ref and acquire/release mm
+	 * per-iteration. When the process exits (lead_thread->mm becomes NULL),
+	 * the thread self-terminates.
+	 */
 	if (node->kfd2kgd->read_wave_pcs) {
 		uint32_t owner_pasid;
+		struct kfd_process *proc;
+		struct mm_struct *mm;
 
 		sample_buf = kvmalloc_array(PCS_MAX_KERNEL_SAMPLES,
 					    sizeof(struct kfd_pcs_sample),
@@ -316,16 +325,14 @@ static int kfd_pc_sample_thread(void *param)
 			goto skip_delivery_init;
 		}
 
-		mm = get_task_mm(proc->lead_thread);
-		/* Release process ref immediately to avoid circular ref:
-		 * thread holds proc ref → proc refcount never 0 →
-		 * kfd_process_wq_release (which stops thread) never runs.
-		 * We only need mm, not proc.
-		 */
+		/* Hold task_struct ref (lightweight — doesn't block mm cleanup) */
+		lead_thread = proc->lead_thread;
+		get_task_struct(lead_thread);
 		kfd_unref_process(proc);
-		proc = NULL;
+
+		mm = get_task_mm(lead_thread);
 		if (!mm) {
-			pr_warn("pcs: failed to get mm for pasid=%u\n", owner_pasid);
+			pr_warn("pcs: failed to get mm\n");
 			goto skip_delivery_init;
 		}
 
@@ -350,6 +357,9 @@ static int kfd_pc_sample_thread(void *param)
 				kthread_unuse_mm(mm);
 			}
 		}
+
+		/* Release mm immediately — only held per-iteration in the loop */
+		mmput(mm);
 
 		if (device_data_va && buf_size) {
 			have_delivery = true;
@@ -424,20 +434,27 @@ skip_delivery_init:
 				}
 
 				if (n_samples > 0) {
-					int written;
+					struct mm_struct *mm = get_task_mm(lead_thread);
 
+					if (!mm) {
+						pr_warn("pcs: process exited, stopping\n");
+						break;
+					}
 					kthread_use_mm(mm);
-					written = pcs_write_to_device_data(
-						device_data_va, buf_size,
-						sample_buf, n_samples,
-						&total_delivered);
+					{
+						int written = pcs_write_to_device_data(
+							device_data_va, buf_size,
+							sample_buf, n_samples,
+							&total_delivered);
+						if (written < n_samples &&
+						    (trigger_loop_count <= 10 ||
+						     !(trigger_loop_count % 2000)))
+							pr_warn("pcs: write n=%d written=%d total=%llu\n",
+								n_samples, written,
+								total_delivered);
+					}
 					kthread_unuse_mm(mm);
-					if (written < n_samples &&
-					    (trigger_loop_count <= 10 ||
-					     !(trigger_loop_count % 2000)))
-						pr_warn("pcs: write n=%d written=%d total=%llu\n",
-							n_samples, written,
-							total_delivered);
+					mmput(mm);
 				}
 			} else {
 				/* Fallback: trigger without delivery */
@@ -481,16 +498,16 @@ skip_delivery_init:
 		for_each_inst(inst, node->xcc_mask)
 			node->kfd2kgd->override_core_cg(adev, 0, inst);
 
-	/* Cleanup */
-	if (mm)
-		mmput(mm);
-	if (proc)
-		kfd_unref_process(proc);
-	kvfree(sample_buf);
-
+	/* Cleanup — set node fields BEFORE put_task_struct since async
+	 * cleanup (triggered by our mmput at init) could free node later.
+	 */
 	node->pcs_data.hosttrap_entry.target_simd = 0;
 	node->pcs_data.hosttrap_entry.target_wave_slot = 0;
-	node->pcs_data.hosttrap_entry.pc_sample_thread = NULL;
+	WRITE_ONCE(node->pcs_data.hosttrap_entry.pc_sample_thread, NULL);
+
+	if (lead_thread)
+		put_task_struct(lead_thread);
+	kvfree(sample_buf);
 
 	return 0;
 }
