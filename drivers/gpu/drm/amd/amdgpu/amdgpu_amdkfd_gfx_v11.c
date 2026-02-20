@@ -1027,7 +1027,7 @@ done:
 
 	amdkfd_gfx11_last_trapped_count = 0;
 
-	if (call_count <= 10 || (samples > 0 && (total_samples % 5000 == 0)))
+	if (call_count <= 10 || !(call_count % 2000))
 		dev_info(adev->dev,
 			 "read_pcs: call=%d valid=%d priv=%d vmid_match=%d samples=%d total=%d corrupt=%d\n",
 			 call_count, valid_count, priv_count, vmid_match, samples, total_samples, corrupt_count);

@@ -424,12 +424,20 @@ skip_delivery_init:
 				}
 
 				if (n_samples > 0) {
+					int written;
+
 					kthread_use_mm(mm);
-					pcs_write_to_device_data(
+					written = pcs_write_to_device_data(
 						device_data_va, buf_size,
 						sample_buf, n_samples,
 						&total_delivered);
 					kthread_unuse_mm(mm);
+					if (written < n_samples &&
+					    (trigger_loop_count <= 10 ||
+					     !(trigger_loop_count % 2000)))
+						pr_warn("pcs: write n=%d written=%d total=%llu\n",
+							n_samples, written,
+							total_delivered);
 				}
 			} else {
 				/* Fallback: trigger without delivery */
