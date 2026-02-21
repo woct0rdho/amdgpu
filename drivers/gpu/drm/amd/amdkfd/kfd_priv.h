@@ -309,8 +309,6 @@ struct kfd_dev_pcs_hosttrap {
 	uint64_t trap_tba_addr;     /* cached TBA used for per-VMID trap program */
 	uint64_t trap_tma_addr;     /* cached TMA used for per-VMID trap program */
 	struct task_struct *pc_sample_thread;
-	struct kfd_pcs_sample *sample_buf;  /* kernel sample buffer */
-	int sample_buf_max;                 /* max entries in sample_buf */
 };
 
 struct kfd_dev_stochastic {

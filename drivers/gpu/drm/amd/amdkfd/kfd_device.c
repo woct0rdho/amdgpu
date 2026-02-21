@@ -483,11 +483,6 @@ struct kfd_dev *kgd2kfd_probe(struct amdgpu_device *adev, bool vf)
 		return NULL;
 	}
 
-	pr_info("kfd probe: gc_ip=%06x gfx_target=%u vf=%u f2g=%px get_atc=%px trigger_pc_sample_trap=%px\n",
-		amdgpu_ip_version(adev, GC_HWIP, 0), gfx_target_version, vf,
-		f2g, f2g->get_atc_vmid_pasid_mapping_info,
-		f2g->trigger_pc_sample_trap);
-
 	kfd = kzalloc(sizeof(*kfd), GFP_KERNEL);
 	if (!kfd)
 		return NULL;
